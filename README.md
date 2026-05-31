@@ -33,24 +33,37 @@ cannot do.
 
 ## Install
 
-Requires Python ≥3.10 on a POSIX system (Linux/macOS). With [uv](https://docs.astral.sh/uv/) installed, register it with Claude Code:
+Requires Python ≥3.10 on a POSIX system (Linux/macOS). `cleat` is on
+[PyPI](https://pypi.org/project/cleat/).
+
+Register it with Claude Code — with [uv](https://docs.astral.sh/uv/) (no install step needed):
 
 ```sh
-claude mcp add cleat -- uvx --from git+https://github.com/sidyellur/cleat cleat
+claude mcp add cleat -- uvx cleat
 ```
 
-Or add it to a project's `.mcp.json`:
+…or if you'd rather install it into your environment first:
+
+```sh
+pip install cleat
+claude mcp add cleat -- cleat
+```
+
+Either way, you can add it to a project's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "cleat": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/sidyellur/cleat", "cleat"]
+      "args": ["cleat"]
     }
   }
 }
 ```
+
+To run the latest unreleased code straight from git instead of PyPI, use
+`uvx --from git+https://github.com/sidyellur/cleat cleat`.
 
 For local development:
 
