@@ -1,5 +1,7 @@
 # cleat
 
+[![CI](https://github.com/sidyellur/cleat/actions/workflows/ci.yml/badge.svg)](https://github.com/sidyellur/cleat/actions/workflows/ci.yml)
+
 **A headless terminal layer for AI agents.** `cleat` runs a *persistent* shell
 session behind a PTY, parses its byte stream for [OSC 133](https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md)
 shell-integration marks, and exposes it to an agent over [MCP](https://modelcontextprotocol.io)
