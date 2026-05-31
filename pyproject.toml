@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cleat"
+version = "0.1.0"
+description = "A headless terminal layer: a persistent PTY + OSC 133 structure source, exposed to AI agents over MCP."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "sidyellur", email = "20009719+sidyellur@users.noreply.github.com" }]
+keywords = ["mcp", "terminal", "pty", "osc133", "shell-integration", "agent", "claude", "claude-code"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Terminals",
+]
+dependencies = [
+    "ptyprocess>=0.7",
+    "pyte>=0.8",
+    "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "build"]
+
+[project.scripts]
+cleat = "cleat.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.urls]
+Homepage = "https://github.com/sidyellur/cleat"
+Issues = "https://github.com/sidyellur/cleat/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cleat"]
+# The vendored bash-preexec.sh (+ its license) under src/cleat/vendor/ ships
+# automatically (hatchling includes all non-VCS-ignored files in the package);
+# the bash injection rcfile references it by absolute path at runtime.
