@@ -104,6 +104,10 @@ class Engine:
             argv, env, self._inject_dir = prepare(self.shell, base_env)
         else:
             argv, env = [self.shell], base_env
+        # A real terminal always sets TERM; an MCP server spawned without a tty
+        # (or CI) may not, which breaks tput/vim/less/fish. We render an xterm via
+        # pyte, so advertise that when nothing else is set.
+        env.setdefault("TERM", "xterm-256color")
         self._proc = ptyprocess.PtyProcess.spawn(
             argv, env=env, dimensions=self.dims
         )
