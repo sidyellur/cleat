@@ -83,7 +83,7 @@ agent ─(MCP)─ server.py ─ engine.py (persistent PTY, ptyprocess)
 
 The engine injects OSC 133 per shell without touching your real config: zsh via
 a temp `$ZDOTDIR`, bash via `--rcfile` + vendored [bash-preexec](https://github.com/rcaloras/bash-preexec),
-fish via its native shell integration (fish ≥4) or an injected init (older fish).
+and fish ≥4 via its native shell integration (older fish is unsupported).
 
 ## Caveats
 
@@ -97,6 +97,9 @@ fish via its native shell integration (fish ≥4) or an injected init (older fis
   `{ ...; }` emits no start mark; its exit code is recovered but stdout for that
   one command is not captured.
 - **Full-screen TUIs:** use `read_screen` (the rendered grid), not `run_command`.
+- **Shells:** zsh and bash are fully supported. fish requires **≥4** (native OSC
+  133) and is supported for command execution; interactive REPL/TUI *driving* is
+  verified on zsh/bash.
 
 ## License
 

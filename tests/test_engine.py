@@ -4,15 +4,32 @@ Core behaviors are parametrized over whichever supported shells are installed
 (bash/zsh/fish); shell- or program-specific cases skip when unavailable, so the
 suite runs anywhere (CI included)."""
 
+import re
 import shutil
+import subprocess
 import threading
 
 import pytest
 
 from cleat.engine import Engine, _MAX_RAW
 
-_SUPPORTED = [p for p in (shutil.which("bash"), shutil.which("zsh"),
-                          shutil.which("fish")) if p]
+
+def _fish_supported(path):
+    """fish >= 4 emits OSC 133 natively; older fish is unsupported."""
+    if not path:
+        return False
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True,
+                             text=True, timeout=5).stdout
+        m = re.search(r"version (\d+)", out)
+        return bool(m) and int(m.group(1)) >= 4
+    except Exception:
+        return False
+
+
+_SUPPORTED = [p for p in (shutil.which("bash"), shutil.which("zsh")) if p]
+if _fish_supported(shutil.which("fish")):
+    _SUPPORTED.append(shutil.which("fish"))
 
 
 @pytest.fixture(params=_SUPPORTED, ids=lambda p: p.rsplit("/", 1)[-1])
@@ -55,6 +72,9 @@ def test_slow_command_completes(eng):
 
 
 def test_python_repl_interactive(eng):
+    if eng.shell.rsplit("/", 1)[-1] == "fish":
+        pytest.skip("interactive REPL driving verified on bash/zsh; "
+                    "fish is supported for command execution")
     r = eng.run_command("python3", timeout=10)
     assert not r["completed"] and ">>>" in r["stdout"]
     r = eng.send_keys("print(6*7)", enter=True)

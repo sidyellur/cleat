@@ -8,8 +8,8 @@ user's real config. Each shell has its own injection seam:
     zsh  -> $ZDOTDIR points at a temp dir whose .zshrc re-sources the user's
             config then installs the marks.
     bash -> --rcfile <tempfile> that sources ~/.bashrc then installs the marks.
-    fish -> -C "source <tempfile>"; fish still auto-loads the user's config, so
-            we only append the marks.
+    fish -> no injection: fish >= 4 emits OSC 133 natively (injecting too would
+            double the marks). fish < 4 is unsupported.
 
 prepare(shell, env) returns (argv, env, cleanup_dir): the argv to spawn, the env
 to spawn it with, and a temp dir to rmtree on exit (or None). Shared by
@@ -20,9 +20,7 @@ A (prompt-start) is emitted where easy; B (prompt-end) is skipped.
 """
 
 import os
-import re
 import tempfile
-import subprocess
 
 
 OSC133_ZSHRC = r'''# --- headless terminal layer: injected zsh rcfile ---
@@ -71,33 +69,11 @@ fi
 '''
 
 
-OSC133_FISH = r'''# --- headless terminal layer: injected fish init (OSC 133) ---
-function __h133_c --on-event fish_preexec
-    printf '\033]133;C\007'
-end
-function __h133_d --on-event fish_postexec
-    set -l ec $status
-    printf '\033]133;D;%d\007\033]133;A\007' $ec
-end
-'''
-
-
 def _write(dirpath, name, content):
     path = os.path.join(dirpath, name)
     with open(path, "w") as f:
         f.write(content)
     return path
-
-
-def _fish_has_native_osc133(shell):
-    """fish >= 4 emits OSC 133 shell-integration marks on its own."""
-    try:
-        out = subprocess.run([shell, "--version"], capture_output=True,
-                             text=True, timeout=5).stdout
-        m = re.search(r"version (\d+)", out)   # "fish, version 4.7.1"
-        return bool(m) and int(m.group(1)) >= 4
-    except Exception:
-        return False
 
 
 def prepare(shell, base_env):
@@ -122,14 +98,10 @@ def prepare(shell, base_env):
         return [shell, "--rcfile", rc], env, d
 
     if base == "fish":
-        # fish >= 4 emits OSC 133 natively; injecting ours too would DOUBLE every
-        # mark (two C's, two D's per command) and make command correlation racy.
-        # So only inject for older fish that lacks native shell integration.
-        if _fish_has_native_osc133(shell):
-            return [shell], env, None
-        d = tempfile.mkdtemp(prefix="headless-inj-")
-        init = _write(d, "init.fish", OSC133_FISH)
-        return [shell, "-C", f"source {init}"], env, d
+        # fish >= 4 emits OSC 133 natively, so we DON'T inject (doing so would
+        # double every mark and make correlation racy). fish < 4 has no native
+        # integration and is unsupported - it will simply produce no marks.
+        return [shell], env, None
 
     # Unknown shell: spawn as-is, no marks (structure source will see nothing).
     return [shell], env, None
