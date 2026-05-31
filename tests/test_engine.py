@@ -76,7 +76,10 @@ def test_python_repl_interactive(eng):
         pytest.skip("interactive REPL driving verified on bash/zsh; "
                     "fish is supported for command execution")
     r = eng.run_command("python3", timeout=10)
-    assert not r["completed"] and ">>>" in r["stdout"]
+    # REPL stays open (doesn't "complete"). The ">>>" prompt can lag the banner
+    # on slow runners, so prove the REPL actually works by computing in it rather
+    # than asserting on prompt-emit timing.
+    assert not r["completed"]
     r = eng.send_keys("print(6*7)", enter=True)
     assert "42" in r["screen"]
     r = eng.send_keys("exit()", enter=True)
