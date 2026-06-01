@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 
 import pytest
 
@@ -84,6 +85,36 @@ def test_python_repl_interactive(eng):
     assert "42" in r["screen"]
     r = eng.send_keys("exit()", enter=True)
     assert r["completed"] and r["exit_code"] is not None
+
+
+# -- polling after completion (issue #1) -----------------------------------
+def test_read_output_after_completion_reports_done_promptly(eng):
+    # Polling right after a command finished must NOT block the full timeout and
+    # must NOT lie with completed=False: the shell is idle at a prompt, so report
+    # completion immediately with the real last exit code. (issue #1)
+    eng.run_command("echo hi")
+    t0 = time.monotonic()
+    r = eng.read_output(timeout=2.0)
+    elapsed = time.monotonic() - t0
+    assert r["completed"] is True
+    assert r["exit_code"] == 0
+    assert r["output"] == ""          # no NEW command output; prompt chrome != output
+    assert elapsed < 1.0              # returned promptly, didn't burn the timeout
+
+
+def test_read_output_after_completion_reports_failure_exit(eng):
+    eng.run_command("false")
+    r = eng.read_output(timeout=2.0)
+    assert r["completed"] is True and r["exit_code"] == 1
+
+
+def test_read_screen_after_completion_returns_promptly(eng):
+    eng.run_command("echo hi")
+    t0 = time.monotonic()
+    scr = eng.read_screen(timeout=2.0)
+    elapsed = time.monotonic() - t0
+    assert "hi" in scr["screen"]
+    assert elapsed < 1.0              # idle + nothing pending => no settle wait
 
 
 # -- specific cases (bash) -------------------------------------------------
