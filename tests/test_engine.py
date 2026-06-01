@@ -108,6 +108,17 @@ def test_read_output_after_completion_reports_failure_exit(eng):
     assert r["completed"] is True and r["exit_code"] == 1
 
 
+def test_read_output_preserves_tail_of_command_finishing_between_polls(eng):
+    # A long-runner whose output lands AFTER run_command's window must not be
+    # lost: the idle short-circuit only fires when nothing is buffered, so the
+    # tail + completion are still delivered by the following poll. (issue #1)
+    r = eng.run_command("sleep 1; echo LATE", timeout=0.3)
+    assert not r["completed"]                      # timed out mid-sleep
+    r2 = eng.read_output(timeout=3.0)
+    assert "LATE" in r2["output"]                  # tail preserved, not dropped
+    assert r2["completed"] is True and r2["exit_code"] == 0
+
+
 def test_read_screen_after_completion_returns_promptly(eng):
     eng.run_command("echo hi")
     t0 = time.monotonic()

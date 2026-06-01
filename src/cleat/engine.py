@@ -318,19 +318,23 @@ class Engine:
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
         with self._cond:
-            start_rc = self._rec_total()
-            # Shell already idle at a prompt => the previous command finished and
-            # nothing is running. Report that immediately with the real last exit
-            # code instead of blocking the full timeout and returning a
-            # misleading completed=False. Blocking + that false signal is exactly
-            # what pushed callers into defensive over-polling (issue #1). Drop any
-            # pending prompt chrome so a later poll stays clean; it isn't output.
-            if self._struct.idle and self._rec_total() > 0:
-                self._cursor = self._total()
+            # Shell idle at a prompt AND nothing buffered => the previous command
+            # finished and nothing more is coming. Report that immediately with
+            # the real last exit code instead of blocking the full timeout and
+            # returning a misleading completed=False -- that false signal is what
+            # pushed callers into defensive over-polling (issue #1). The
+            # nothing-buffered check matters: a command that finished *between*
+            # polls leaves its output unread, and we must NOT discard it here.
+            if (self._struct.idle and self._cursor >= self._total()
+                    and self._rec_total() > 0):
                 return {"output": "", "exit_code": self._records[-1].exit_code,
                         "completed": True}
             raw = self._read_until_idle(timeout, idle)
-            done = self._rec_total() > start_rc
+            # Completion = the shell is now back at a prompt, not merely "a record
+            # formed during THIS call". A command that finished between polls
+            # already has its record, so keying on record growth alone would drop
+            # its completion signal even though we just drained its output.
+            done = self._struct.idle and self._rec_total() > 0
             exit_code = self._records[-1].exit_code if done else None
             return {"output": _clean(raw), "exit_code": exit_code,
                     "completed": done}
