@@ -11,6 +11,9 @@ dist/
 venv/
 *-venv/
 
+# uv lockfile (generated locally by `uv run`; not tracked for this library)
+uv.lock
+
 # OS / editor
 .DS_Store
 .idea/

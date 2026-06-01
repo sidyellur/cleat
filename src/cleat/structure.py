@@ -80,6 +80,14 @@ class StructureSource:
         """Cleaned stdout captured so far for an in-flight command (post-C)."""
         return _clean(self._stdout)
 
+    @property
+    def idle(self) -> bool:
+        """True when no command is running (the shell sits at a prompt): we've
+        seen a C->D cycle close (or never opened one) and aren't mid-command.
+        Lets the engine tell "finished, nothing more coming" from "still
+        running, momentarily quiet" instead of blocking + guessing."""
+        return self._state == "IDLE"
+
     def feed(self, data: bytes):
         """Push raw bytes in; get back a list of newly-completed records."""
         self._buf += data
