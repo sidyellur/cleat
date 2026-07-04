@@ -45,10 +45,15 @@ from typing import Optional
 _MARK_RE = re.compile(rb"\x1b\]133;([^\x07\x1b]*)(?:\x07|\x1b\\)")
 
 # Strip ANSI noise from captured stdout: CSI sequences, other OSC sequences,
-# and lone two-byte escapes. We parse 133 marks out separately, before this runs.
+# charset designations, and lone two-byte escapes. We parse 133 marks out
+# separately, before this runs.
 _ANSI_RE = re.compile(
     rb"\x1b\[[0-?]*[ -/]*[@-~]"          # CSI  e.g. \x1b[31m, \x1b[K
     rb"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC  e.g. \x1b]0;title\x07
+    rb"|\x1b[()*+\-./][0-~]"              # SCS (charset designation) e.g.
+                                           # \x1b(B - fish's default prompt
+                                           # theme emits one after every color
+                                           # reset
     rb"|\x1b[@-Z\\-_]"                    # other two-byte escapes
 )
 

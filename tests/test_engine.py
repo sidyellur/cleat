@@ -4,9 +4,11 @@ Core behaviors are parametrized over whichever supported shells are installed
 (bash/zsh/fish); shell- or program-specific cases skip when unavailable, so the
 suite runs anywhere (CI included)."""
 
+import os
 import re
 import shutil
 import subprocess
+import termios
 import threading
 import time
 
@@ -48,6 +50,29 @@ def bash_eng():
     e = Engine(shell=bash).start()
     yield e
     e.close()
+
+
+@pytest.fixture
+def fish_eng():
+    fish = shutil.which("fish")
+    if not _fish_supported(fish):
+        pytest.skip("fish >= 4 not installed")
+    e = Engine(shell=fish).start()
+    yield e
+    e.close()
+
+
+def test_engine_inject_false_unaffected(request):
+    # inject=False -> no OSC 133 injection at all -> nonce=None -> the
+    # structure source accepts everything, exactly as before nonces existed.
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not installed")
+    eng = Engine(shell=bash, inject=False).start()
+    request.addfinalizer(eng.close)
+    eng.run_command("echo hi", timeout=1.0)
+    assert eng._struct._nonce is None
+    assert eng._struct.spoofed_marks == 0
 
 
 # -- core behaviors, every supported shell ---------------------------------
@@ -128,6 +153,90 @@ def test_read_screen_after_completion_returns_promptly(eng):
     assert elapsed < 1.0              # idle + nothing pending => no settle wait
 
 
+# -- session-state oracle (issue #5) ---------------------------------------
+def test_state_idle_after_completed_command(eng):
+    eng.run_command("echo hi")
+    r = eng.read_output(timeout=1.0)
+    assert r["completed"] is True
+    assert r["state"] == "idle"
+
+
+def test_state_running_while_command_executes(eng):
+    r = eng.run_command("sleep 3", timeout=0.5)
+    assert not r["completed"]
+    assert r["state"] == "running"
+
+
+def test_state_awaiting_input_in_repl(eng):
+    if eng.shell.rsplit("/", 1)[-1] == "fish":
+        pytest.skip("interactive REPL driving verified on bash/zsh; "
+                    "fish is supported for command execution")
+    r = eng.run_command("python3", timeout=10)
+    assert not r["completed"]
+    assert r["state"] == "awaiting-input"
+    eng.send_keys("exit()", enter=True)
+
+
+def test_state_password_on_read_dash_s(bash_eng):
+    r = bash_eng.run_command("read -s x", timeout=2)
+    assert not r["completed"]
+    assert r["state"] == "password"
+    bash_eng.send_keys("secret", enter=True)  # drain so teardown is clean
+
+
+def test_state_tui_then_idle_after_quit(bash_eng):
+    if not shutil.which("vim"):
+        pytest.skip("vim not installed")
+    bash_eng.run_command("vim -u NONE -N", timeout=5)
+    scr = bash_eng.read_screen()
+    assert scr["state"] == "tui"
+    r = bash_eng.send_keys("\x1b:q!", enter=True)
+    assert r["completed"]
+    assert r["state"] == "idle"
+
+
+def test_forged_mark_cannot_fake_exit_code(eng):
+    # A program run in the session (here, the command line itself) emits an
+    # un-nonced OSC 133 D;0 mark to try to fake a clean exit. It must be
+    # ignored - the REAL, nonced D mark from `false`'s failure is what
+    # closes the command - and the forgery attempt must be visible.
+    if eng.shell.rsplit("/", 1)[-1] == "fish":
+        pytest.skip("fish printf escape handling differs; nonce filtering is "
+                    "covered at the unit level (test_structure.py) and by the "
+                    "fish e2e tests below")
+    r = eng.run_command(r"printf '\033]133;D;0\007'; false")
+    assert r["completed"] is True
+    assert r["exit_code"] == 1
+    assert r.get("spoofed_marks", 0) >= 1
+
+
+def test_probe_state_degrades_on_tcgetattr_failure(bash_eng, monkeypatch):
+    # Mid-command (marks not idle) so the probe reaches the tcgetattr call.
+    bash_eng.run_command("sleep 5", timeout=0.3)
+
+    def _raise(fd):
+        raise termios.error("simulated failure")
+
+    monkeypatch.setattr(termios, "tcgetattr", _raise)
+    with bash_eng._cond:
+        state = bash_eng._probe_state()  # must not raise
+    assert state == "running"            # degrades using marks alone
+    bash_eng.send_keys("\x03")           # interrupt the sleep; clean teardown
+
+
+def test_probe_state_degrades_on_tcgetpgrp_failure(bash_eng, monkeypatch):
+    # Idle at the prompt: the degraded path should still say "idle".
+    bash_eng.run_command("echo hi")
+
+    def _raise(fd):
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(os, "tcgetpgrp", _raise)
+    with bash_eng._cond:
+        state = bash_eng._probe_state()  # must not raise
+    assert state == "idle"
+
+
 # -- specific cases (bash) -------------------------------------------------
 def test_bash_subshell_exit_recovered(bash_eng):
     # First token '(' emits no C mark under bash-preexec; exit code still recovered.
@@ -184,3 +293,29 @@ def test_tui_renders_and_quits(bash_eng):
     assert "~" in scr["screen"]
     r = bash_eng.send_keys("\x1b:q!", enter=True)
     assert r["completed"]
+
+
+# -- fish e2e: nonce-authenticated injection (issue #5) --------------------
+# fish >= 4 emits its own native, un-nonced OSC 133 marks in addition to our
+# injected, nonced ones. Before nonce filtering, fish was excluded from
+# injection entirely to avoid doubled records; now the native marks are
+# ignored outright (see structure.py), so these prove there's no doubling.
+def test_fish_echo_false_persistence(fish_eng):
+    r = fish_eng.run_command("echo hi", timeout=8)
+    assert r == {"stdout": "hi", "exit_code": 0, "completed": True, "state": "idle"}
+
+    r = fish_eng.run_command("false")
+    assert r["exit_code"] == 1 and r["completed"]
+
+    fish_eng.run_command("set -x FOO bar")
+    r = fish_eng.run_command("echo $FOO")
+    assert r["stdout"] == "bar"
+
+
+def test_fish_no_doubled_records(fish_eng):
+    # Exactly one CommandRecord per real command: if fish's native marks were
+    # merely deduplicated rather than filtered out, this would be 2.
+    fish_eng.run_command("echo one")
+    fish_eng.run_command("echo two")
+    fish_eng.run_command("echo three")
+    assert fish_eng._struct.commands_started == 3

@@ -51,6 +51,14 @@ def test_ansi_stripped_from_stdout():
     assert recs[0].stdout == "red"
 
 
+def test_charset_designation_stripped_from_stdout():
+    # fish's default prompt theme emits ESC ( B (select G0 = ASCII) after
+    # every color reset - a real leak seen when fish was first injected (#5).
+    recs = StructureSource().feed(
+        b"\x1b]133;C\x07\x1b[32mhi\x1b(B\x1b[m there\r\n\x1b]133;D;0\x07")
+    assert recs[0].stdout == "hi there"
+
+
 def test_clean_normalizes_newlines_and_trims():
     assert _clean(b"\x1b[Khi\r\nthere\r\n") == "hi\nthere"
     assert _clean(b"\nleading-nl-stripped") == "leading-nl-stripped"
