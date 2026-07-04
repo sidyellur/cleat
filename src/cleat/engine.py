@@ -124,7 +124,13 @@ class Engine:
             argv, env, self._inject_dir, nonce = prepare(self.shell, base_env)
         else:
             argv, env = [self.shell], base_env
-        self._struct = StructureSource(nonce=nonce)
+        # fish >= 4 runs its own native, un-nonced OSC 133 emitter alongside
+        # ours - expected, harmless telemetry, not tampering (see
+        # structure.py's expect_unnonced_marks docs). Only fish is known to
+        # do this; bash/zsh have no ambient native emitter of their own.
+        native_marks_shell = os.path.basename(self.shell) == "fish"
+        self._struct = StructureSource(nonce=nonce,
+                                        expect_unnonced_marks=native_marks_shell)
         # Always advertise xterm-256color, regardless of what TERM (if any)
         # this process inherited. We render via pyte - an xterm-class emulator
         # - so that's what the child should see; an inherited TERM lacking

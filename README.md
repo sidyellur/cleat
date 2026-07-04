@@ -123,11 +123,13 @@ failed. `cleat` closes this: each session gets a fresh `secrets.token_hex(8)`
 nonce at startup, embedded in every mark cleat injects
 (`\033]133;D;<exit>;k=<nonce>\007`). A mark whose `k=` param is missing or
 wrong is ignored outright — it cannot alter `exit_code`, `stdout`, or
-`completed` — and the attempt is counted. `run_command` surfaces that count as
-`spoofed_marks` in its result (only when it’s nonzero), so an agent can tell
-when a program it ran tried to lie about how it finished. This is also what
-makes fish safe to inject into: fish ≥4’s own native marks carry no nonce, so
-they’re ignored the same way a forgery would be, instead of double-counting.
+`completed` either way. A *wrong* `k=` is always surfaced as an attempted
+forgery; a *missing* `k=` is too, unless the shell is known to run its own
+legitimate native OSC 133 alongside ours (fish ≥4) — that's expected
+telemetry, not tampering, so it's ignored quietly instead of triggering a
+false alarm on every fish command. `run_command` surfaces the real count as
+`spoofed_marks` in its result (only when it's nonzero), so an agent can tell
+when a program it ran tried to lie about how it finished.
 
 ## Caveats
 

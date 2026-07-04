@@ -32,7 +32,10 @@ run_command also carries "spoofed_marks" (only when > 0): a program run in
 this session tried to forge an OSC 133 completion mark. It can't alter the
 real exit_code/stdout/completed you get back - those are authenticated - but
 its attempt is visible here, and that program's own claims about its exit
-status should be treated as hostile.
+status should be treated as hostile. (On fish >= 4, its own native OSC 133
+telemetry never carries our nonce either, but that's expected and excluded
+from this count - only a wrong nonce, or a missing one on a shell without its
+own native emitter, counts as a forgery attempt.)
 """
 
 import atexit

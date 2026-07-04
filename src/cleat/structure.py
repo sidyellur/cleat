@@ -28,10 +28,17 @@ Things learned from real spy logs that this handles:
 
 Nonce-authenticated marks: pass nonce=<hex string> (see inject.py) and every
 C/D/A mark must carry a matching `;k=<hex>` param or it's ignored entirely -
-state, stdout, and exit code are untouched - and counted in spoofed_marks.
-This closes the ANSI-injection hole where a program cleat runs could emit its
-own `ESC ]133;D;0 BEL` to forge a successful exit code. nonce=None (the
-default) accepts every mark, matching pre-nonce behavior exactly.
+state, stdout, and exit code are always untouched either way. This closes the
+ANSI-injection hole where a program cleat runs could emit its own
+`ESC ]133;D;0 BEL` to forge a successful exit code. nonce=None (the default)
+accepts every mark, matching pre-nonce behavior exactly.
+
+A rejected mark is also counted in spoofed_marks, UNLESS it has no `k=` param
+at all *and* expect_unnonced_marks=True - some shells run their own native,
+un-nonced OSC 133 emitter alongside ours (fish >= 4), and that's expected
+telemetry, not tampering, so it shouldn't trip a tamper counter. A mark with a
+*wrong* `k=` value is always counted regardless - only a deliberate attempt to
+impersonate our scheme would bother including one.
 """
 
 import re
@@ -81,11 +88,18 @@ def _clean(raw: bytes) -> str:
 
 
 class StructureSource:
-    def __init__(self, nonce=None):
+    def __init__(self, nonce=None, expect_unnonced_marks=False):
         self._buf = b""          # bytes not yet resolved (may hold a partial mark)
         self._state = "IDLE"     # IDLE | RUNNING
         self._stdout = b""       # raw stdout accumulated while RUNNING
         self._nonce = nonce      # expected k=<hex> on C/D/A marks; None = accept all
+        # Some shells have their OWN native OSC 133 emitter running alongside
+        # ours (fish >= 4) that will never carry our nonce - that's expected,
+        # harmless telemetry, not tampering. A mark with NO k= at all is only
+        # suppressed from spoofed_marks when this is set; a mark with a WRONG
+        # k= is always counted, on every shell - only something trying to
+        # impersonate our scheme would bother including one.
+        self._expect_unnonced_marks = expect_unnonced_marks
         self.commands_started = 0  # bumped on each C mark (output-begins)
         self.prompts_seen = 0      # bumped on each A mark (prompt-start shown)
         self.spoofed_marks = 0     # forged/wrong-nonce C/D/A marks seen and ignored
@@ -146,8 +160,13 @@ class StructureSource:
             if nonce_val != self._nonce:
                 # Forged or wrong-nonce mark: a program we run cannot use this
                 # to fake completion or an exit code. Ignore it completely -
-                # state/stdout/counters below are untouched.
-                self.spoofed_marks += 1
+                # state/stdout below are untouched either way. Only bump the
+                # visible tamper counter if this isn't a bare mark from a
+                # shell's own expected native emitter (fish >= 4): a WRONG
+                # k= is always counted (that's a deliberate impersonation
+                # attempt), a MISSING k= is counted unless expected.
+                if not (nonce_val is None and self._expect_unnonced_marks):
+                    self.spoofed_marks += 1
                 return None
 
         if code == "C":                      # command output begins

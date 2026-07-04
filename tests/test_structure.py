@@ -137,3 +137,42 @@ def test_forged_mark_cannot_override_real_exit_code():
     recs = src.feed(stream)
     assert _pairs(recs) == [("real-output", 1)]
     assert src.spoofed_marks == 1
+
+
+# -- expect_unnonced_marks (fish's own native OSC 133 alongside ours) -------
+
+def test_expected_unnonced_marks_ignored_but_not_counted():
+    # fish >= 4's own native marks never carry our k= param. That's expected
+    # telemetry, not tampering, when the caller says so - ignored for state
+    # exactly as before, but NOT added to the visible tamper counter.
+    nonce = "session-nonce"
+    src = StructureSource(nonce=nonce, expect_unnonced_marks=True)
+    recs = src.feed(
+        b"\x1b]133;C\x07"                              # native, no k=
+        b"\x1b]133;C;k=" + nonce.encode() + b"\x07"     # ours
+        b"hi"
+        b"\x1b]133;D;0;k=" + nonce.encode() + b"\x07"   # ours
+        b"\x1b]133;D;0\x07"                              # native, no k=
+        b"\x1b]133;A\x07")                              # native, no k=
+    assert _pairs(recs) == [("hi", 0)]
+    assert src.spoofed_marks == 0
+
+
+def test_wrong_nonce_still_counted_even_when_unnonced_expected():
+    # A WRONG k= is always suspicious, regardless of expect_unnonced_marks -
+    # fish's native marks never carry a k= param at all, so a mark that DOES
+    # carry one, but the wrong one, can only be a deliberate impersonation
+    # attempt, not native shell telemetry.
+    src = StructureSource(nonce="correct", expect_unnonced_marks=True)
+    recs = src.feed(b"\x1b]133;C;k=wrong\x07x\x1b]133;D;0;k=wrong\x07")
+    assert recs == []
+    assert src.spoofed_marks == 2
+
+
+def test_expect_unnonced_marks_false_by_default():
+    # Default behavior (bash/zsh - no ambient native emitter) is unchanged:
+    # a bare unnonced mark is still counted.
+    src = StructureSource(nonce="deadbeef")
+    recs = src.feed(b"\x1b]133;C\x07x\x1b]133;D;0\x07")
+    assert recs == []
+    assert src.spoofed_marks == 2
