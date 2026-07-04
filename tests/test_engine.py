@@ -153,6 +153,55 @@ def test_read_screen_after_completion_returns_promptly(eng):
     assert elapsed < 1.0              # idle + nothing pending => no settle wait
 
 
+# -- wait_for: block until the session needs attention (issue #10) --------
+def test_wait_for_returns_immediately_when_already_idle(eng):
+    eng.run_command("echo hi")
+    t0 = time.monotonic()
+    r = eng.wait_for(timeout=5.0)
+    elapsed = time.monotonic() - t0
+    assert r["completed"] is True and r["exit_code"] == 0
+    assert elapsed < 1.0              # already idle -> no blocking wait
+
+
+def test_wait_for_blocks_until_long_command_completes(eng):
+    r = eng.run_command("sleep 1; echo woke", timeout=0.2)
+    assert not r["completed"]                      # timed out mid-sleep
+    t0 = time.monotonic()
+    r2 = eng.wait_for(timeout=5.0)
+    elapsed = time.monotonic() - t0
+    assert "woke" in r2["output"]
+    assert r2["completed"] is True and r2["exit_code"] == 0
+    assert r2["state"] == "idle"
+    assert 0.5 < elapsed < 4.0        # actually waited for it, didn't just poll once
+
+
+def test_wait_for_returns_on_repl_prompt(eng):
+    if eng.shell.rsplit("/", 1)[-1] == "fish":
+        pytest.skip("interactive REPL driving verified on bash/zsh; "
+                    "fish is supported for command execution")
+    eng.run_command("python3", timeout=1)   # banner may not have settled yet
+    r = eng.wait_for(timeout=10.0)
+    assert not r["completed"]
+    assert r["state"] == "awaiting-input"
+    eng.send_keys("exit()", enter=True)     # drain so teardown is clean
+
+
+def test_wait_for_times_out_while_still_running(bash_eng):
+    bash_eng.run_command("sleep 5", timeout=0.2)
+    t0 = time.monotonic()
+    r = bash_eng.wait_for(timeout=0.5)
+    elapsed = time.monotonic() - t0
+    assert not r["completed"]
+    assert r["state"] == "running"
+    assert elapsed < 1.5              # honored the short timeout
+
+
+def test_wait_for_raises_if_not_started():
+    e = Engine(shell=shutil.which("bash"))
+    with pytest.raises(RuntimeError):
+        e.wait_for(timeout=1.0)
+
+
 # -- session-state oracle (issue #5) ---------------------------------------
 def test_state_idle_after_completed_command(eng):
     eng.run_command("echo hi")

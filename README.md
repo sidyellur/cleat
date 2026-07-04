@@ -94,6 +94,7 @@ cleat            # runs the MCP server over stdio
 |------|---------|---------|
 | `run_command(command, timeout)` | `{stdout, exit_code, completed, state}` (+ `files_changed` if watching, `spoofed_marks` if tampered) | normal commands — full, exact stdout |
 | `read_output(timeout)` | `{output, exit_code, completed, state}` | watching a long-running / streaming command |
+| `wait_for(timeout)` | `{output, exit_code, completed, state}` | blocking until the session needs attention — replaces a `read_output` polling loop |
 | `read_screen()` | `{screen, cursor, state}` | inspecting a full-screen TUI (vim, top, less) |
 | `send_keys(keys, enter)` | `{screen, cursor, exit_code, completed, state}` | driving a REPL / TUI / prompt (control chars pass through: ``=Ctrl-C) |
 | `resize(cols, rows)` | `{cols, rows}` | laying out a TUI for a given size |

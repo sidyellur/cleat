@@ -151,6 +151,27 @@ def read_output(timeout: float = 2.0) -> dict:
     return _get_engine().read_output(timeout=timeout)
 
 
+@mcp.tool()
+def wait_for(timeout: float = 30.0) -> dict:
+    """Block until the session needs attention instead of polling for it.
+
+    Use this in place of a read_output() loop when a command might run
+    longer than one call's timeout: it returns the instant the state leaves
+    "running" - the command finished, a REPL/prompt is waiting for input, a
+    password prompt appeared, or a TUI took over - with no guessed poll
+    interval. Returns immediately if the session isn't "running" already.
+    Returns {output, exit_code, completed, state}; same shape as
+    read_output. See the module docstring for what each `state` value
+    implies you should do next.
+
+    Args:
+        timeout: max seconds to block before returning completed=False /
+            state="running" (default 30 - longer than read_output's default
+            since the point of this tool is to wait out a long-runner).
+    """
+    return _get_engine().wait_for(timeout=timeout)
+
+
 def main():
     """Console-script entry point: run the MCP server over stdio."""
     mcp.run()
