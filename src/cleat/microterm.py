@@ -59,16 +59,17 @@ def main():
     args = ap.parse_args()
 
     spy = open(args.spy, "w") if args.spy else None
-    struct = StructureSource() if args.structure else None
     struct_out = open(args.structure, "w") if args.structure else None
     shell = os.environ.get("SHELL", "/bin/bash")
 
     # Set up OSC 133 injection (zsh/bash/fish) before we fork.
     inject_dir = None
+    nonce = None
     if args.inject:
-        argv, child_env, inject_dir = prepare(shell, os.environ.copy())
+        argv, child_env, inject_dir, nonce = prepare(shell, os.environ.copy())
     else:
         argv, child_env = [shell], None
+    struct = StructureSource(nonce=nonce) if args.structure else None
 
     # pty.fork() splits us in two:
     #   child  -> its stdin/stdout/stderr ARE the PTY slave; we just exec a shell

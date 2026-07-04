@@ -71,6 +71,8 @@ class Engine:
         self._watch_root = watch_root   # if set, run_command reports files_changed
         self._proc = None
         self._inject_dir = None
+        # Constructed in start() once we know the injection nonce (or lack
+        # thereof); a pre-start placeholder so attribute access never 500s.
         self._struct = StructureSource()
 
         # Second consumer of the same byte stream: a virtual screen. pyte
@@ -100,10 +102,12 @@ class Engine:
     # -- lifecycle ----------------------------------------------------------
     def start(self):
         base_env = os.environ.copy()
+        nonce = None
         if self.inject:
-            argv, env, self._inject_dir = prepare(self.shell, base_env)
+            argv, env, self._inject_dir, nonce = prepare(self.shell, base_env)
         else:
             argv, env = [self.shell], base_env
+        self._struct = StructureSource(nonce=nonce)
         # A real terminal always sets TERM; an MCP server spawned without a tty
         # (or CI) may not, which breaks tput/vim/less/fish. We render an xterm via
         # pyte, so advertise that when nothing else is set.
