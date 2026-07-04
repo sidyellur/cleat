@@ -8,18 +8,29 @@ user's real config. Each shell has its own injection seam:
     zsh  -> $ZDOTDIR points at a temp dir whose .zshrc re-sources the user's
             config then installs the marks.
     bash -> --rcfile <tempfile> that sources ~/.bashrc then installs the marks.
-    fish -> no injection: fish >= 4 emits OSC 133 natively (injecting too would
-            double the marks). fish < 4 is unsupported.
+    fish -> `fish -C 'source <tempdir>/marks.fish'` installs marks via an
+            on-event function, in ADDITION to fish's own native OSC 133 (fish
+            >= 4). We deliberately do NOT override $XDG_CONFIG_HOME - children
+            spawned in the session inherit env, and clobbering it would break
+            git/tools that read fish's config location. fish's native marks
+            aren't nonced, so structure.py's nonce filtering ignores them
+            instead of double-counting. fish < 4 has no native integration and
+            is unsupported for TUI/prompt detection either way.
 
-prepare(shell, env) returns (argv, env, cleanup_dir): the argv to spawn, the env
-to spawn it with, and a temp dir to rmtree on exit (or None). Shared by
-microterm.py (interactive demonstrator) and engine.py. No third-party deps.
+prepare(shell, env) returns (argv, env, cleanup_dir, nonce): the argv to spawn,
+the env to spawn it with, a temp dir to rmtree on exit (or None), and the
+per-session nonce embedded in every injected mark (or None if nothing was
+injected). Shared by microterm.py (interactive demonstrator) and engine.py.
+No third-party deps.
 
 Parser contract (see structure.py): only C (output-begins) and D;<exit> matter.
-A (prompt-start) is emitted where easy; B (prompt-end) is skipped.
+A (prompt-start) is emitted where easy; B (prompt-end) is skipped. Every C/D/A
+mark carries a `;k=<nonce>` param so structure.py can authenticate it - see
+"Nonce-authenticated marks" in structure.py's docstring.
 """
 
 import os
+import secrets
 import tempfile
 
 
@@ -29,8 +40,8 @@ ZDOTDIR="${_HEADLESS_REAL_ZDOTDIR:-$HOME}"
 [ -f "$ZDOTDIR/.zshrc" ]  && source "$ZDOTDIR/.zshrc"
 
 autoload -Uz add-zsh-hook
-_h133_preexec() { printf '\033]133;C\007' }
-_h133_precmd()  { printf '\033]133;D;%s\007\033]133;A\007' "$?" }
+_h133_preexec() { printf '\033]133;C;k=@NONCE@\007' }
+_h133_precmd()  { printf '\033]133;D;%s;k=@NONCE@\007\033]133;A;k=@NONCE@\007' "$?" }
 add-zsh-hook preexec _h133_preexec
 add-zsh-hook precmd  _h133_precmd
 
@@ -54,11 +65,11 @@ if [ -r '@BASH_PREEXEC_PATH@' ]; then
   source '@BASH_PREEXEC_PATH@'
 
   # C: right before each command runs.
-  __h133_preexec() { printf '\033]133;C\007'; }
+  __h133_preexec() { printf '\033]133;C;k=@NONCE@\007'; }
   # D;<exit> + A: capture $? FIRST, then emit prev exit code + next-prompt mark.
   __h133_precmd() {
     local ec=$?
-    printf '\033]133;D;%s\007\033]133;A\007' "$ec"
+    printf '\033]133;D;%s;k=@NONCE@\007\033]133;A;k=@NONCE@\007' "$ec"
   }
   preexec_functions+=(__h133_preexec)
   precmd_functions+=(__h133_precmd)
@@ -66,6 +77,19 @@ fi
 # NOTE: bash-preexec does NOT fire preexec when the command's first token is a
 # subshell (...) or brace group { ...; } - such a command emits no C mark. The
 # parser recovers its exit code as a zero-output record (see structure.py).
+'''
+
+
+# Installed via `fish -C 'source <path>'`, NOT $XDG_CONFIG_HOME (see module
+# docstring). fish >= 4 also emits its own native, un-nonced OSC 133 marks;
+# structure.py's nonce filtering ignores those rather than double-counting.
+OSC133_FISH = r'''# --- headless terminal layer: injected fish marks ---
+function __h133_pre --on-event fish_preexec
+    printf '\033]133;C;k=@NONCE@\007'
+end
+function __h133_post --on-event fish_postexec
+    printf '\033]133;D;%s;k=@NONCE@\007\033]133;A;k=@NONCE@\007' $status
+end
 '''
 
 
@@ -77,31 +101,41 @@ def _write(dirpath, name, content):
 
 
 def prepare(shell, base_env):
-    """Return (argv, env, cleanup_dir) to spawn `shell` with OSC 133 injected."""
+    """Return (argv, env, cleanup_dir, nonce) to spawn `shell` with nonce-
+    authenticated OSC 133 injected. nonce is a fresh secrets.token_hex(8) per
+    call, or None for an unknown shell (nothing was injected)."""
     base = os.path.basename(shell)
     env = dict(base_env)
 
     if base == "zsh":
+        nonce = secrets.token_hex(8)
         d = tempfile.mkdtemp(prefix="headless-inj-")
-        _write(d, ".zshrc", OSC133_ZSHRC)
+        _write(d, ".zshrc", OSC133_ZSHRC.replace("@NONCE@", nonce))
         env["_HEADLESS_REAL_ZDOTDIR"] = env.get("ZDOTDIR", env.get("HOME", ""))
         env["ZDOTDIR"] = d
-        return [shell], env, d
+        return [shell], env, d, nonce
 
     if base == "bash":
+        nonce = secrets.token_hex(8)
         d = tempfile.mkdtemp(prefix="headless-inj-")
         # bash-preexec.sh is vendored next to this module so its absolute path
         # survives even though the rcfile is written into a throwaway temp dir.
         bp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "vendor", "bash-preexec.sh")
-        rc = _write(d, "bashrc", OSC133_BASHRC.replace("@BASH_PREEXEC_PATH@", bp))
-        return [shell, "--rcfile", rc], env, d
+        rc = _write(d, "bashrc", OSC133_BASHRC
+                    .replace("@BASH_PREEXEC_PATH@", bp)
+                    .replace("@NONCE@", nonce))
+        return [shell, "--rcfile", rc], env, d, nonce
 
     if base == "fish":
-        # fish >= 4 emits OSC 133 natively, so we DON'T inject (doing so would
-        # double every mark and make correlation racy). fish < 4 has no native
-        # integration and is unsupported - it will simply produce no marks.
-        return [shell], env, None
+        # fish >= 4 emits its own native, un-nonced OSC 133 marks too - the
+        # nonce filter in structure.py ignores those instead of double-
+        # counting them. We inject via `-C`, not $XDG_CONFIG_HOME (see module
+        # docstring), so children spawned in the session see a normal env.
+        nonce = secrets.token_hex(8)
+        d = tempfile.mkdtemp(prefix="headless-inj-")
+        marks_path = _write(d, "marks.fish", OSC133_FISH.replace("@NONCE@", nonce))
+        return [shell, "-C", f"source '{marks_path}'"], env, d, nonce
 
     # Unknown shell: spawn as-is, no marks (structure source will see nothing).
-    return [shell], env, None
+    return [shell], env, None, None

@@ -25,6 +25,20 @@ Things learned from real spy logs that this handles:
   - a mark can be split across two feed() calls - we buffer the tail
   - the first precmd emits a lone ]133;D;0 before any command - ignored
   - stdout regions carry color/cursor escapes - stripped for legibility
+
+Nonce-authenticated marks: pass nonce=<hex string> (see inject.py) and every
+C/D/A mark must carry a matching `;k=<hex>` param or it's ignored entirely -
+state, stdout, and exit code are always untouched either way. This closes the
+ANSI-injection hole where a program cleat runs could emit its own
+`ESC ]133;D;0 BEL` to forge a successful exit code. nonce=None (the default)
+accepts every mark, matching pre-nonce behavior exactly.
+
+A rejected mark is also counted in spoofed_marks, UNLESS it has no `k=` param
+at all *and* expect_unnonced_marks=True - some shells run their own native,
+un-nonced OSC 133 emitter alongside ours (fish >= 4), and that's expected
+telemetry, not tampering, so it shouldn't trip a tamper counter. A mark with a
+*wrong* `k=` value is always counted regardless - only a deliberate attempt to
+impersonate our scheme would bother including one.
 """
 
 import re
@@ -38,10 +52,15 @@ from typing import Optional
 _MARK_RE = re.compile(rb"\x1b\]133;([^\x07\x1b]*)(?:\x07|\x1b\\)")
 
 # Strip ANSI noise from captured stdout: CSI sequences, other OSC sequences,
-# and lone two-byte escapes. We parse 133 marks out separately, before this runs.
+# charset designations, and lone two-byte escapes. We parse 133 marks out
+# separately, before this runs.
 _ANSI_RE = re.compile(
     rb"\x1b\[[0-?]*[ -/]*[@-~]"          # CSI  e.g. \x1b[31m, \x1b[K
     rb"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC  e.g. \x1b]0;title\x07
+    rb"|\x1b[()*+\-./][0-~]"              # SCS (charset designation) e.g.
+                                           # \x1b(B - fish's default prompt
+                                           # theme emits one after every color
+                                           # reset
     rb"|\x1b[@-Z\\-_]"                    # other two-byte escapes
 )
 
@@ -69,12 +88,21 @@ def _clean(raw: bytes) -> str:
 
 
 class StructureSource:
-    def __init__(self):
+    def __init__(self, nonce=None, expect_unnonced_marks=False):
         self._buf = b""          # bytes not yet resolved (may hold a partial mark)
         self._state = "IDLE"     # IDLE | RUNNING
         self._stdout = b""       # raw stdout accumulated while RUNNING
+        self._nonce = nonce      # expected k=<hex> on C/D/A marks; None = accept all
+        # Some shells have their OWN native OSC 133 emitter running alongside
+        # ours (fish >= 4) that will never carry our nonce - that's expected,
+        # harmless telemetry, not tampering. A mark with NO k= at all is only
+        # suppressed from spoofed_marks when this is set; a mark with a WRONG
+        # k= is always counted, on every shell - only something trying to
+        # impersonate our scheme would bother including one.
+        self._expect_unnonced_marks = expect_unnonced_marks
         self.commands_started = 0  # bumped on each C mark (output-begins)
         self.prompts_seen = 0      # bumped on each A mark (prompt-start shown)
+        self.spoofed_marks = 0     # forged/wrong-nonce C/D/A marks seen and ignored
 
     def partial_stdout(self) -> str:
         """Cleaned stdout captured so far for an in-flight command (post-C)."""
@@ -124,7 +152,22 @@ class StructureSource:
 
     def _mark(self, payload: str):
         """Apply one mark's payload; return a CommandRecord if one just closed."""
-        code = payload[0] if payload else ""
+        parts = payload.split(";")
+        code = parts[0] if parts and parts[0] else ""
+
+        if code in ("C", "D", "A") and self._nonce is not None:
+            nonce_val = next((p[2:] for p in parts[1:] if p.startswith("k=")), None)
+            if nonce_val != self._nonce:
+                # Forged or wrong-nonce mark: a program we run cannot use this
+                # to fake completion or an exit code. Ignore it completely -
+                # state/stdout below are untouched either way. Only bump the
+                # visible tamper counter if this isn't a bare mark from a
+                # shell's own expected native emitter (fish >= 4): a WRONG
+                # k= is always counted (that's a deliberate impersonation
+                # attempt), a MISSING k= is counted unless expected.
+                if not (nonce_val is None and self._expect_unnonced_marks):
+                    self.spoofed_marks += 1
+                return None
 
         if code == "C":                      # command output begins
             self._state = "RUNNING"
@@ -134,7 +177,6 @@ class StructureSource:
 
         if code == "D":                      # command finished
             exit_code = None
-            parts = payload.split(";")
             # Full-match, not lstrip+isdigit: a payload like "D;--5" must fall
             # through to None, not reach int() and raise out of feed().
             if len(parts) > 1 and re.fullmatch(r"-?\d+", parts[1]):
