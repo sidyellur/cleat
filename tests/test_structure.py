@@ -54,3 +54,63 @@ def test_ansi_stripped_from_stdout():
 def test_clean_normalizes_newlines_and_trims():
     assert _clean(b"\x1b[Khi\r\nthere\r\n") == "hi\nthere"
     assert _clean(b"\nleading-nl-stripped") == "leading-nl-stripped"
+
+
+# -- nonce-authenticated marks ----------------------------------------------
+
+def test_nonce_none_accepts_unnonced_marks_unchanged():
+    # Default (no nonce passed): behaves exactly like before nonces existed.
+    src = StructureSource()
+    recs = src.feed(b"\x1b]133;C\x07hi\x1b]133;D;0\x07")
+    assert _pairs(recs) == [("hi", 0)]
+    assert src.spoofed_marks == 0
+
+
+def test_nonced_stream_parses_identically_to_unnonced():
+    nonce = "deadbeef01234567"
+    stream = (b"\x1b]133;A;k=" + nonce.encode() + b"\x07prompt$ "
+              b"\x1b]133;C;k=" + nonce.encode() + b"\x07hello\r\n"
+              b"\x1b]133;D;0;k=" + nonce.encode() + b"\x07"
+              b"\x1b]133;A;k=" + nonce.encode() + b"\x07prompt$ "
+              b"\x1b]133;C;k=" + nonce.encode() + b"\x07"
+              b"\x1b]133;D;1;k=" + nonce.encode() + b"\x07")
+    recs = StructureSource(nonce=nonce).feed(stream)
+    assert _pairs(recs) == [("hello", 0), ("", 1)]
+
+
+def test_exit_code_parses_with_trailing_nonce_param():
+    src = StructureSource(nonce="abc123")
+    recs = src.feed(b"\x1b]133;C;k=abc123\x07out\x1b]133;D;1;k=abc123\x07")
+    assert _pairs(recs) == [("out", 1)]
+
+
+def test_missing_nonce_mark_ignored_and_counted():
+    src = StructureSource(nonce="deadbeef")
+    # Neither mark carries k=<hex> at all -> both ignored, both counted.
+    recs = src.feed(b"\x1b]133;C\x07should-not-open-a-command\x1b]133;D;0\x07")
+    assert recs == []
+    assert src.spoofed_marks == 2
+
+
+def test_wrong_nonce_mark_ignored_and_counted():
+    src = StructureSource(nonce="correct-nonce")
+    recs = src.feed(b"\x1b]133;C;k=wrong\x07x\x1b]133;D;0;k=wrong\x07")
+    assert recs == []
+    assert src.spoofed_marks == 2
+
+
+def test_forged_mark_cannot_override_real_exit_code():
+    # A program running inside the session forges an un-nonced D;0 mid-command
+    # to fake success. It must be ignored - the real, correctly-nonced D;1
+    # closes the command with the true exit code, and the forgery is counted.
+    nonce = "session-nonce"
+    src = StructureSource(nonce=nonce)
+    stream = (
+        b"\x1b]133;C;k=" + nonce.encode() + b"\x07"
+        b"real-output"
+        b"\x1b]133;D;0\x07"                          # forged: no nonce, ignored
+        b"\x1b]133;D;1;k=" + nonce.encode() + b"\x07"  # real close
+    )
+    recs = src.feed(stream)
+    assert _pairs(recs) == [("real-output", 1)]
+    assert src.spoofed_marks == 1

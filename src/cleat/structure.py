@@ -25,6 +25,13 @@ Things learned from real spy logs that this handles:
   - a mark can be split across two feed() calls - we buffer the tail
   - the first precmd emits a lone ]133;D;0 before any command - ignored
   - stdout regions carry color/cursor escapes - stripped for legibility
+
+Nonce-authenticated marks: pass nonce=<hex string> (see inject.py) and every
+C/D/A mark must carry a matching `;k=<hex>` param or it's ignored entirely -
+state, stdout, and exit code are untouched - and counted in spoofed_marks.
+This closes the ANSI-injection hole where a program cleat runs could emit its
+own `ESC ]133;D;0 BEL` to forge a successful exit code. nonce=None (the
+default) accepts every mark, matching pre-nonce behavior exactly.
 """
 
 import re
@@ -69,12 +76,14 @@ def _clean(raw: bytes) -> str:
 
 
 class StructureSource:
-    def __init__(self):
+    def __init__(self, nonce=None):
         self._buf = b""          # bytes not yet resolved (may hold a partial mark)
         self._state = "IDLE"     # IDLE | RUNNING
         self._stdout = b""       # raw stdout accumulated while RUNNING
+        self._nonce = nonce      # expected k=<hex> on C/D/A marks; None = accept all
         self.commands_started = 0  # bumped on each C mark (output-begins)
         self.prompts_seen = 0      # bumped on each A mark (prompt-start shown)
+        self.spoofed_marks = 0     # forged/wrong-nonce C/D/A marks seen and ignored
 
     def partial_stdout(self) -> str:
         """Cleaned stdout captured so far for an in-flight command (post-C)."""
@@ -124,7 +133,17 @@ class StructureSource:
 
     def _mark(self, payload: str):
         """Apply one mark's payload; return a CommandRecord if one just closed."""
-        code = payload[0] if payload else ""
+        parts = payload.split(";")
+        code = parts[0] if parts and parts[0] else ""
+
+        if code in ("C", "D", "A") and self._nonce is not None:
+            nonce_val = next((p[2:] for p in parts[1:] if p.startswith("k=")), None)
+            if nonce_val != self._nonce:
+                # Forged or wrong-nonce mark: a program we run cannot use this
+                # to fake completion or an exit code. Ignore it completely -
+                # state/stdout/counters below are untouched.
+                self.spoofed_marks += 1
+                return None
 
         if code == "C":                      # command output begins
             self._state = "RUNNING"
@@ -134,7 +153,6 @@ class StructureSource:
 
         if code == "D":                      # command finished
             exit_code = None
-            parts = payload.split(";")
             if len(parts) > 1 and parts[1].lstrip("-").isdigit():
                 exit_code = int(parts[1])
             if self._state == "RUNNING":
