@@ -20,22 +20,32 @@ Two completion signals, because the D mark alone isn't enough:
 
 API:
     eng = Engine().start()
-    eng.run_command("ls")                  # {stdout, exit_code, completed}
+    eng.run_command("ls")                  # {stdout, exit_code, completed, state}
     eng.run_command("python3", timeout=5)  # completed=False, stdout has the banner+'>>>'
-    eng.send_keys("print(6*7)", enter=True)# {output, exit_code, completed}
-    eng.read_output()                      # poll a long-runner; {output, exit_code, completed}
+    eng.send_keys("print(6*7)", enter=True)# {screen, cursor, exit_code, completed, state}
+    eng.read_output()                      # poll a long-runner; {output, exit_code, completed, state}
     eng.close()
 
 Scope: line-oriented interactive programs (REPLs, prompts, streaming output).
 Full-screen TUIs (vim/top) emit cursor-addressing that only means anything when
 rendered into a screen grid - that needs a terminal emulator (pyte) and is a
 separate step, not handled here.
+
+Session-state oracle: every agent-facing result also carries a "state" field
+-  "idle" | "running" | "awaiting-input" | "password" | "tui" - derived from
+termios flags and the foreground process group (facts only the PTY owner can
+read), not guessed from output timing. See _probe_state() for the derivation
+and PLAN.md for the full rationale. "spoofed_marks" appears alongside it,
+but only when a program running in the session has tried to forge an OSC 133
+mark (see structure.py's nonce filtering).
 """
 
 import os
+import re
 import time
 import shutil
 import threading
+import termios
 
 import ptyprocess
 import pyte
@@ -49,6 +59,13 @@ _MAX_RAW = 1 << 20  # 1 MiB
 # Keep only the most recent records; older ones are evicted (callers use
 # absolute indices via _rec_base, so eviction is transparent).
 _MAX_RECORDS = 256
+
+# Alternate-screen enter/exit (DECSET/DECRST 1049, 1047, 47 - vim/less/top all
+# use one of these). 'h' enters, 'l' exits; last match in a chunk wins. A
+# sequence split across two reads is acceptable to miss for v0.2 - pyte's
+# screen still renders correctly either way, only the `state` probe misses a
+# beat until the next chunk arrives.
+_ALTSCREEN_RE = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
 
 
 def _serialized(method):
@@ -71,6 +88,8 @@ class Engine:
         self._watch_root = watch_root   # if set, run_command reports files_changed
         self._proc = None
         self._inject_dir = None
+        self._shell_pid = None  # set in start(); the state probe's "fg" baseline
+        self._altscreen = False  # tracked in _read_loop; drives state=="tui"
         # Constructed in start() once we know the injection nonce (or lack
         # thereof); a pre-start placeholder so attribute access never 500s.
         self._struct = StructureSource()
@@ -86,9 +105,7 @@ class Engine:
         # callers read under the lock and wait on the cond. To stay bounded over
         # a long-lived session, both buffers keep only a recent window and track
         # an absolute base index of element [0], so positions/indices are
-        # absolute (eviction-invariant) and old data can be dropped. run_command
-        # takes the FIRST new record (a command may emit two marks - e.g. fish
-        # 4.x native + our injected - and only the first carries the output).
+        # absolute (eviction-invariant) and old data can be dropped.
         self._raw = bytearray()      # recent window of bytes the shell emitted
         self._base = 0               # absolute index of _raw[0] (bytes dropped)
         self._cursor = 0             # absolute index of next unconsumed byte
@@ -108,13 +125,20 @@ class Engine:
         else:
             argv, env = [self.shell], base_env
         self._struct = StructureSource(nonce=nonce)
-        # A real terminal always sets TERM; an MCP server spawned without a tty
-        # (or CI) may not, which breaks tput/vim/less/fish. We render an xterm via
-        # pyte, so advertise that when nothing else is set.
-        env.setdefault("TERM", "xterm-256color")
+        # Always advertise xterm-256color, regardless of what TERM (if any)
+        # this process inherited. We render via pyte - an xterm-class emulator
+        # - so that's what the child should see; an inherited TERM lacking
+        # alt-screen support (e.g. "linux", "dumb" - common when the MCP
+        # server itself has no controlling tty) would otherwise make vim/less
+        # skip smcup/rmcup entirely, and state=="tui" would never fire.
+        env["TERM"] = "xterm-256color"
         self._proc = ptyprocess.PtyProcess.spawn(
             argv, env=env, dimensions=self.dims
         )
+        # The shell is the session/process-group leader, so its pgid == its
+        # pid - the state probe's baseline for "is the shell in the
+        # foreground, i.e. nothing else has the terminal right now".
+        self._shell_pid = self._proc.pid
         self._alive = True
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -135,6 +159,10 @@ class Engine:
                 recs = self._struct.feed(data)
                 self._raw += data
                 self._records.extend(recs)
+                # Track alt-screen entry/exit for the state probe (state=="tui").
+                altscreen_matches = _ALTSCREEN_RE.findall(data)
+                if altscreen_matches:
+                    self._altscreen = altscreen_matches[-1] == b"h"
                 try:
                     self._pyte.feed(data)
                 except Exception:
@@ -225,6 +253,54 @@ class Engine:
             lines.pop()
         return "\n".join(lines), [self._screen.cursor.x, self._screen.cursor.y]
 
+    def _probe_state(self):
+        """Derive the session state from termios/fg-pgid facts instead of
+        guessing from output timing - see PLAN.md for the full rationale.
+        Caller holds _cond. ORDER IS LOAD-BEARING (first match wins):
+
+          1. idle           - fg == shell pid AND marks idle. Must be first:
+                               zsh's ZLE / bash's readline put the terminal in
+                               raw mode AT THE PROMPT, so checking termios
+                               before this would misread a prompt as
+                               awaiting-input.
+          2. tui             - alt-screen active (vim/top/less).
+          3. password        - ECHO off, ICANON on (sudo, read -s, getpass).
+          4. awaiting-input  - ICANON off: a readline/libedit line editor is
+                               provably blocked on input.
+          5. running         - a child owns the terminal and none of the
+                               above matched. Honest residue: canonical-mode
+                               `cat` waiting on stdin is indistinguishable
+                               from a busy program by termios alone.
+
+        Never raises: if tcgetpgrp/tcgetattr fail (OSError/termios.error -
+        e.g. the fd closed under us), degrade to idle/running from marks
+        alone, since this sits on every agent-facing response."""
+        try:
+            fg = os.tcgetpgrp(self._proc.fd)
+            if fg == self._shell_pid and self._struct.idle:
+                return "idle"
+            if self._altscreen:
+                return "tui"
+            lflag = termios.tcgetattr(self._proc.fd)[3]
+            echo = bool(lflag & termios.ECHO)
+            icanon = bool(lflag & termios.ICANON)
+            if not echo and icanon:
+                return "password"
+            if not icanon:
+                return "awaiting-input"
+            return "running"
+        except (OSError, termios.error):
+            return "idle" if self._struct.idle else "running"
+
+    def _augment(self, result):
+        """Add the protocol-level state field (always) and spoofed_marks
+        (only when a forged mark has been seen) to an agent-facing result
+        dict. Caller holds _cond."""
+        result["state"] = self._probe_state()
+        if self._struct.spoofed_marks:
+            result["spoofed_marks"] = self._struct.spoofed_marks
+        return result
+
     def _read_until_idle(self, timeout, idle):
         """Collect output until it goes quiet for `idle`s or `timeout`s elapses.
         Caller holds _cond. Returns the raw bytes collected."""
@@ -252,12 +328,16 @@ class Engine:
     # -- the agent-facing API ----------------------------------------------
     @_serialized
     def run_command(self, cmd, timeout=10.0, idle=0.4) -> dict:
-        """Run a command. Returns {stdout, exit_code, completed}.
+        """Run a command. Returns {stdout, exit_code, completed, state}.
 
         completed=True  -> a D mark closed the command; exit_code is real.
         completed=False -> output went idle with no D: the program is waiting
                            for input or still running. stdout is what we have so
                            far; follow up with send_keys()/read_output().
+        state -> see _probe_state(): "idle"|"running"|"awaiting-input"|
+                 "password"|"tui", derived from termios/fg-pgid, not guessed.
+        spoofed_marks -> present (and >0) only if a program in the session
+                          tried to forge an OSC 133 mark; see structure.py.
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
@@ -294,7 +374,9 @@ class Engine:
                 prev_len = cur_len
 
             if self._rec_total() > start_rc:
-                # FIRST new record (a doubled-mark command's 2nd record is empty).
+                # The new record. Only ever one now: fish's native marks carry
+                # no nonce, so structure.py's nonce filtering ignores them
+                # entirely instead of emitting a second (empty) record.
                 rec = self._records[start_rc - self._rec_base]
                 self._cursor = self._total()
                 result = {"stdout": rec.stdout, "exit_code": rec.exit_code,
@@ -304,6 +386,7 @@ class Engine:
                 self._cursor = self._total()
                 result = {"stdout": self._struct.partial_stdout(),
                           "exit_code": None, "completed": False}
+            result = self._augment(result)
 
         # files-touched: diff the watched tree once the command has finished.
         if before is not None and result["completed"]:
@@ -317,8 +400,9 @@ class Engine:
     @_serialized
     def read_output(self, timeout=2.0, idle=0.4) -> dict:
         """Poll for output without sending anything (e.g. watch a long-runner).
-        Returns {output, exit_code, completed}; exit_code is set if a command
-        finished while we were reading."""
+        Returns {output, exit_code, completed, state}; exit_code is set if a
+        command finished while we were reading. See run_command for `state`
+        and `spoofed_marks`."""
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
         with self._cond:
@@ -331,8 +415,9 @@ class Engine:
             # polls leaves its output unread, and we must NOT discard it here.
             if (self._struct.idle and self._cursor >= self._total()
                     and self._rec_total() > 0):
-                return {"output": "", "exit_code": self._records[-1].exit_code,
-                        "completed": True}
+                return self._augment({
+                    "output": "", "exit_code": self._records[-1].exit_code,
+                    "completed": True})
             raw = self._read_until_idle(timeout, idle)
             # Completion = the shell is now back at a prompt, not merely "a record
             # formed during THIS call". A command that finished between polls
@@ -340,15 +425,16 @@ class Engine:
             # its completion signal even though we just drained its output.
             done = self._struct.idle and self._rec_total() > 0
             exit_code = self._records[-1].exit_code if done else None
-            return {"output": _clean(raw), "exit_code": exit_code,
-                    "completed": done}
+            return self._augment({"output": _clean(raw), "exit_code": exit_code,
+                                   "completed": done})
 
     @_serialized
     def read_screen(self, settle=0.3, timeout=1.0) -> dict:
         """Return the rendered virtual screen (what the terminal looks like now)
-        plus the cursor [x, y]. Briefly waits for output to settle first so a
-        mid-redraw frame isn't captured. Use this for TUIs and REPLs; use
-        read_output() for streaming text you don't want truncated to the screen."""
+        plus the cursor [x, y] and state. Briefly waits for output to settle
+        first so a mid-redraw frame isn't captured. Use this for TUIs and
+        REPLs; use read_output() for streaming text you don't want truncated
+        to the screen."""
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
         with self._cond:
@@ -358,7 +444,7 @@ class Engine:
             if not (self._struct.idle and self._cursor >= self._total()):
                 self._read_until_idle(timeout, settle)  # flush pending bytes
             screen, cursor = self._render_screen()
-            return {"screen": screen, "cursor": cursor}
+            return self._augment({"screen": screen, "cursor": cursor})
 
     @_serialized
     def send_keys(self, keys, enter=False, timeout=2.0, idle=0.4) -> dict:
@@ -366,9 +452,9 @@ class Engine:
 
         Control chars go through as-is: "\\u0003"=Ctrl-C, "\\u0004"=Ctrl-D.
         Set enter=True to append a newline. Returns {screen, exit_code,
-        completed}; the screen is pyte-rendered so REPL/TUI output is clean (no
-        per-keystroke redraw noise). completed=True (with exit_code) if the
-        program exited.
+        completed, state}; the screen is pyte-rendered so REPL/TUI output is
+        clean (no per-keystroke redraw noise). completed=True (with exit_code)
+        if the program exited.
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
@@ -380,8 +466,8 @@ class Engine:
             done = self._rec_total() > start_rc
             exit_code = self._records[-1].exit_code if done else None
             screen, cursor = self._render_screen()
-            return {"screen": screen, "cursor": cursor, "exit_code": exit_code,
-                    "completed": done}
+            return self._augment({"screen": screen, "cursor": cursor,
+                                   "exit_code": exit_code, "completed": done})
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +482,8 @@ if __name__ == "__main__":
 
     try:
         r = eng.run_command("echo hello")
-        check("one-shot echo", r == {"stdout": "hello", "exit_code": 0, "completed": True}, str(r))
+        check("one-shot echo", r == {"stdout": "hello", "exit_code": 0,
+                                      "completed": True, "state": "idle"}, str(r))
 
         r = eng.run_command("false")
         check("exit code 1", r["exit_code"] == 1 and r["completed"], str(r))
@@ -411,8 +498,10 @@ if __name__ == "__main__":
 
         # interactive REPL: run_command should NOT hang; returns completed=False.
         r = eng.run_command("python3", timeout=8)
-        check("repl starts (not completed)",
-              (not r["completed"]) and (">>>" in r["stdout"]), repr(r["stdout"][-40:]))
+        check("repl starts (not completed, state=awaiting-input)",
+              (not r["completed"]) and (">>>" in r["stdout"])
+              and r["state"] == "awaiting-input",
+              f"state={r.get('state')} stdout={r['stdout'][-40:]!r}")
 
         r = eng.send_keys("print(6*7)", enter=True)
         # screen-rendered: the answer is present AND the per-keystroke redraw
@@ -425,16 +514,22 @@ if __name__ == "__main__":
 
         # interrupt a hung command with Ctrl-C.
         r = eng.run_command("sleep 30", timeout=1.0)
-        check("sleep not completed", not r["completed"], str(r))
+        check("sleep not completed (state=running)",
+              not r["completed"] and r["state"] == "running",
+              f"state={r.get('state')} r={r}")
         r = eng.send_keys("")  # Ctrl-C
         check("ctrl-c interrupts", r["completed"] and r["exit_code"] is not None, str(r))
 
         # full-screen TUI: vim should render (empty buffer shows '~' rows), then quit.
         r = eng.run_command("vim -u NONE -N", timeout=4)
         scr = eng.read_screen()
-        check("vim renders (TUI)", "~" in scr["screen"], repr(scr["screen"][:60]))
+        check("vim renders (TUI, state=tui)",
+              "~" in scr["screen"] and scr["state"] == "tui",
+              f"state={scr.get('state')} screen={scr['screen'][:60]!r}")
         r = eng.send_keys("\x1b:q!", enter=True)  # ESC then :q!
-        check("vim quits", r["completed"], str({k: r[k] for k in ("exit_code", "completed")}))
+        check("vim quits (state=idle)",
+              r["completed"] and r["state"] == "idle",
+              str({k: r.get(k) for k in ("exit_code", "completed", "state")}))
 
         # (3) dynamic resize: PTY width should follow.
         eng.resize(80, 24)
@@ -470,7 +565,7 @@ if __name__ == "__main__":
         beng = Engine(shell="/bin/bash").start()
         try:
             rb = beng.run_command("echo hi")
-            print(f"{'ok ' if rb == {'stdout':'hi','exit_code':0,'completed':True} else 'FAIL'} bash echo -> {rb}")
+            print(f"{'ok ' if rb == {'stdout':'hi','exit_code':0,'completed':True,'state':'idle'} else 'FAIL'} bash echo -> {rb}")
             rb = beng.run_command("false")
             print(f"{'ok ' if rb['exit_code']==1 and rb['completed'] else 'FAIL'} bash false exit=1 -> {rb}")
             # subshell first-token: no C mark; parser must still recover exit code.
@@ -488,7 +583,7 @@ if __name__ == "__main__":
         feng = Engine(shell=fish).start()
         try:
             rf = feng.run_command("echo hi", timeout=8)
-            print(f"{'ok ' if rf == {'stdout':'hi','exit_code':0,'completed':True} else 'FAIL'} fish echo -> {rf}")
+            print(f"{'ok ' if rf == {'stdout':'hi','exit_code':0,'completed':True,'state':'idle'} else 'FAIL'} fish echo -> {rf}")
             rf = feng.run_command("false")
             print(f"{'ok ' if rf['exit_code']==1 and rf['completed'] else 'FAIL'} fish false exit=1 -> {rf}")
             rf = feng.run_command("echo second")

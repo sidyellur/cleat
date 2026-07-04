@@ -53,7 +53,7 @@ def bash_eng():
 # -- core behaviors, every supported shell ---------------------------------
 def test_echo(eng):
     assert eng.run_command("echo hi") == {
-        "stdout": "hi", "exit_code": 0, "completed": True}
+        "stdout": "hi", "exit_code": 0, "completed": True, "state": "idle"}
 
 
 def test_nonzero_exit(eng):
