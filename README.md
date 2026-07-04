@@ -24,12 +24,26 @@ never prints it.
 out, so the agent gets:
 
 ```json
-{ "stdout": "...", "exit_code": 0, "completed": true }
+{ "stdout": "...", "exit_code": 0, "completed": true, "state": "idle" }
 ```
 
 …and the session is **persistent**: `cd`, `export`, activated venvs, and `ssh`
 sessions all carry across calls — something a fresh `subprocess` per command
 cannot do.
+
+## Session state
+
+Every tool response carries a `state` field, derived from termios flags and
+the foreground process group — facts only the process holding the PTY can
+read — instead of guessed from output timing:
+
+| `state` | Meaning | What to do |
+|---------|---------|------------|
+| `idle` | nothing is running | call `run_command` for the next thing |
+| `running` | a command is executing | poll `read_output` |
+| `awaiting-input` | a REPL/prompt is blocked on stdin | drive it with `send_keys` |
+| `password` | a secret prompt (`sudo`, `read -s`) is waiting, echo off | **stop** — only send input here with the human's explicit consent |
+| `tui` | a full-screen program (vim, top, less) owns the terminal | use `read_screen`/`send_keys`, not `run_command` |
 
 ## Install
 
@@ -78,27 +92,42 @@ cleat            # runs the MCP server over stdio
 
 | Tool | Returns | Use for |
 |------|---------|---------|
-| `run_command(command, timeout)` | `{stdout, exit_code, completed}` (+ `files_changed` if watching) | normal commands — full, exact stdout |
-| `read_output(timeout)` | `{output, exit_code, completed}` | watching a long-running / streaming command |
-| `read_screen()` | `{screen, cursor}` | inspecting a full-screen TUI (vim, top, less) |
-| `send_keys(keys, enter)` | `{screen, cursor, exit_code, completed}` | driving a REPL / TUI / prompt (control chars pass through: ``=Ctrl-C) |
+| `run_command(command, timeout)` | `{stdout, exit_code, completed, state}` (+ `files_changed` if watching, `spoofed_marks` if tampered) | normal commands — full, exact stdout |
+| `read_output(timeout)` | `{output, exit_code, completed, state}` | watching a long-running / streaming command |
+| `read_screen()` | `{screen, cursor, state}` | inspecting a full-screen TUI (vim, top, less) |
+| `send_keys(keys, enter)` | `{screen, cursor, exit_code, completed, state}` | driving a REPL / TUI / prompt (control chars pass through: ``=Ctrl-C) |
 | `resize(cols, rows)` | `{cols, rows}` | laying out a TUI for a given size |
 | `watch_files(path)` | `{watch_root}` | enable per-command `files_changed` under `path` |
 
 `completed: false` means the program is still running or waiting for input (e.g.
-a REPL) — drive it with `send_keys` and poll with `read_output`.
+a REPL) — check `state` (above) for what to do next.
 
 ## How it works
 
 ```
 agent ─(MCP)─ server.py ─ engine.py (persistent PTY, ptyprocess)
-                            ├─ structure.py  → OSC 133 marks → {stdout, exit_code}
+                            ├─ structure.py  → OSC 133 marks → {stdout, exit_code, state}
                             └─ pyte screen    → rendered view for REPLs/TUIs
 ```
 
 The engine injects OSC 133 per shell without touching your real config: zsh via
 a temp `$ZDOTDIR`, bash via `--rcfile` + vendored [bash-preexec](https://github.com/rcaloras/bash-preexec),
-and fish ≥4 via its native shell integration (older fish is unsupported).
+and fish via `fish -C 'source ...'` (fish ≥4 also emits its own native marks
+alongside ours; see below for why that’s harmless).
+
+### Nonce-authenticated marks
+
+A command you run can print arbitrary bytes to its own stdout — including a
+fake `ESC ]133;D;0 BEL`, forging a clean exit code for output that actually
+failed. `cleat` closes this: each session gets a fresh `secrets.token_hex(8)`
+nonce at startup, embedded in every mark cleat injects
+(`\033]133;D;<exit>;k=<nonce>\007`). A mark whose `k=` param is missing or
+wrong is ignored outright — it cannot alter `exit_code`, `stdout`, or
+`completed` — and the attempt is counted. `run_command` surfaces that count as
+`spoofed_marks` in its result (only when it’s nonzero), so an agent can tell
+when a program it ran tried to lie about how it finished. This is also what
+makes fish safe to inject into: fish ≥4’s own native marks carry no nonce, so
+they’re ignored the same way a forgery would be, instead of double-counting.
 
 ## Caveats
 
@@ -112,9 +141,10 @@ and fish ≥4 via its native shell integration (older fish is unsupported).
   `{ ...; }` emits no start mark; its exit code is recovered but stdout for that
   one command is not captured.
 - **Full-screen TUIs:** use `read_screen` (the rendered grid), not `run_command`.
-- **Shells:** zsh and bash are fully supported. fish requires **≥4** (native OSC
-  133) and is supported for command execution; interactive REPL/TUI *driving* is
-  verified on zsh/bash.
+- **Shells:** zsh and bash are fully supported, including interactive REPL/TUI
+  driving. fish is supported for command execution on **≥4** (its own native
+  marks require that version; cleat's injection works alongside them either
+  way — see [Nonce-authenticated marks](#nonce-authenticated-marks)).
 
 ## License
 

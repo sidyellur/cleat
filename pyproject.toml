@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cleat"
-version = "0.1.0"
+version = "0.2.0"
 description = "A headless terminal layer: a persistent PTY + OSC 133 structure source, exposed to AI agents over MCP."
 readme = "README.md"
 license = { file = "LICENSE" }
