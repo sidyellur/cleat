@@ -58,3 +58,49 @@
   fails deterministically on zsh, but it's not a regression — zsh was simply
   never installed/tested in this environment before. Left it alone as out of
   scope for this issue rather than scope-creeping into an unrelated fix.
+
+## wait_for: block until the session needs attention (issue #10)
+
+- Picked this as the next feature deliberately, not by default: it's the one
+  candidate from the original landscape research that's built directly on
+  top of the state oracle rather than being a standalone concern (secret
+  redaction, audit trails, multi-session). Wrote the plan with an explicit
+  non-goals section up front — no output pattern matching, no target-state
+  parameter, no cancellation — because each of those quietly reintroduces
+  the exact fragile-heuristic problem the state oracle was built to remove,
+  just moved into a new tool's parameters. Scope discipline mattered more
+  here than for v0.2, precisely because the implementation itself is tiny
+  (a thin wrapper on `_cond`/`_probe_state()`).
+
+- Testing surfaced a real race the plan didn't anticipate: on zsh,
+  `_probe_state()` can transiently report `awaiting-input` for one beat
+  *right as a command is about to finish* — zsh reclaims the foreground
+  pgid and re-enters its own raw ZLE mode the instant the child exits, but
+  its `precmd` hook's D/A marks (what actually closes the record) haven't
+  reached the reader thread yet. Existing methods never hit this because
+  they block on idle-silence/record-count, not on `state` in a tight loop —
+  `wait_for` is the first caller that does, so it's the first to expose it.
+  Fixed with a short bounded grace window scoped entirely inside `wait_for`
+  (no changes to `_probe_state` itself), gated on `fg == shell pid` so a
+  genuine interactive wait (where a *child* still owns the terminal) is
+  never delayed by it.
+
+- Spun up an independent review agent with deliberately zero conversation
+  context — just the PR number and pointers to the issue/plan — specifically
+  so it couldn't inherit my own blind spots about my own fix. It verified
+  everything itself (fresh clone, ran the real test suite, reran the new
+  test 5x) rather than trusting the PR description, and it caught something
+  real: the race fix was a bounded mitigation, not a full resolution, and
+  had no regression test — only manual reruns on real zsh timing, which
+  only reproduced the bug ~3/4 of the time. Took the finding at face value
+  and added a test that forces the exact false reading deterministically via
+  `monkeypatch` (pinned `tcgetpgrp`, cleared `ICANON`) instead of depending
+  on real shell timing — confirmed it actually catches the regression by
+  temporarily reverting the fix and watching the new test fail.
+
+- Shipped 0.2.0 → 0.2.1 as a plain patch release (additive tool, no breaking
+  changes) and learned the repo's `release.yml` only publishes to PyPI on a
+  pushed `v*` tag — merging to `main` alone doesn't ship anything to
+  `pip install cleat` users. Easy to miss since nothing fails loudly when a
+  feature merges but the version never bumps; worth checking for on every
+  "done" project that publishes a package.
