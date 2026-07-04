@@ -39,6 +39,21 @@ def test_idle_D_after_first_command_recovers_exit():
     assert _pairs(recs) == [("", 7)]
 
 
+def test_malformed_exit_code_yields_none_not_crash():
+    # Anything running in the shell can print bytes that look like a D mark.
+    # A malformed exit-code field must degrade to exit_code=None, not raise
+    # out of feed() (which would kill the engine's read loop).
+    for bad in (b"--5", b"abc", b"5x", b"-", b""):
+        src = StructureSource()
+        recs = src.feed(b"\x1b]133;C\x07out\x1b]133;D;" + bad + b"\x07")
+        assert _pairs(recs) == [("out", None)], bad
+
+
+def test_negative_exit_code_still_parsed():
+    recs = StructureSource().feed(b"\x1b]133;C\x07\x1b]133;D;-1\x07")
+    assert _pairs(recs) == [("", -1)]
+
+
 def test_st_terminator_accepted():
     # Some terminals end OSC with ST (ESC backslash) instead of BEL.
     recs = StructureSource().feed(b"\x1b]133;C\x1b\\hi\x1b]133;D;0\x1b\\")

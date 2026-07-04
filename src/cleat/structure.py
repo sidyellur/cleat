@@ -135,7 +135,9 @@ class StructureSource:
         if code == "D":                      # command finished
             exit_code = None
             parts = payload.split(";")
-            if len(parts) > 1 and parts[1].lstrip("-").isdigit():
+            # Full-match, not lstrip+isdigit: a payload like "D;--5" must fall
+            # through to None, not reach int() and raise out of feed().
+            if len(parts) > 1 and re.fullmatch(r"-?\d+", parts[1]):
                 exit_code = int(parts[1])
             if self._state == "RUNNING":
                 rec = CommandRecord(stdout=_clean(self._stdout), exit_code=exit_code)
