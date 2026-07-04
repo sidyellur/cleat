@@ -202,6 +202,40 @@ def test_wait_for_raises_if_not_started():
         e.wait_for(timeout=1.0)
 
 
+def test_wait_for_settle_window_survives_stale_non_running_state(bash_eng, monkeypatch):
+    # Regression test for a race found via manual zsh testing while building
+    # wait_for (PR #11): on zsh, the shell reclaims the foreground pgid and
+    # re-enters its own raw ZLE mode the instant a child exits - a beat
+    # BEFORE its precmd hook's D/A completion marks are actually parsed. That
+    # makes _probe_state() transiently report a non-"running" state (here,
+    # "awaiting-input") for a command that hasn't actually finished yet.
+    # Manual reruns only reproduced it ~3/4 of the time on real zsh timing;
+    # force the exact misreading deterministically here (fg == shell pid,
+    # ICANON off) on bash instead, so this is fast and 100% reproducible
+    # regardless of which shells happen to be installed.
+    r = bash_eng.run_command("sleep 0.1; echo woke", timeout=0.02)
+    assert not r["completed"]                      # still running for real
+
+    shell_pid = bash_eng._shell_pid
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: shell_pid)
+    real_tcgetattr = termios.tcgetattr
+
+    def _fake_tcgetattr(fd):
+        attrs = list(real_tcgetattr(fd))
+        attrs[3] &= ~termios.ICANON      # forces the "awaiting-input" branch
+        return attrs
+
+    monkeypatch.setattr(termios, "tcgetattr", _fake_tcgetattr)
+    with bash_eng._cond:
+        assert bash_eng._probe_state() == "awaiting-input"  # confirm the fake fools it
+
+    # Despite the state claiming "awaiting-input" throughout, the settle
+    # window must still wait for the REAL completion instead of trusting it.
+    r2 = bash_eng.wait_for(timeout=2.0)
+    assert r2["completed"] is True and r2["exit_code"] == 0
+    assert "woke" in r2["output"]
+
+
 # -- session-state oracle (issue #5) ---------------------------------------
 def test_state_idle_after_completed_command(eng):
     eng.run_command("echo hi")
