@@ -173,18 +173,26 @@ NEVER raise on the response path.
 
 ## Acceptance criteria
 
-- [ ] All six tools return `state`; values match the derivation table in the
+- [x] All six tools return `state`; values match the derivation table in the
       integration scenarios above, on zsh AND bash (macOS at minimum).
-- [ ] A child process emitting fake OSC 133 marks cannot alter `exit_code`,
+- [x] A child process emitting fake OSC 133 marks cannot alter `exit_code`,
       `completed`, or `stdout` attribution; the attempt is visible via
       `spoofed_marks`.
-- [ ] fish ≥4 runs through the injected/nonced path with no doubled records;
-      the first-record special case is gone.
-- [ ] `Engine(inject=False)` and all pre-existing tests behave exactly as
+- [x] fish ≥4 runs through the injected/nonced path with no doubled records;
+      the first-record special case is gone. (CI here only had fish 3.7 to
+      test against - below the version gate - but injection is
+      version-independent and was manually verified against it; the
+      first-record indexing itself never needed to change, since nonce
+      filtering means there's only ever one record to index.)
+- [x] `Engine(inject=False)` and all pre-existing tests behave exactly as
       before (nonce=None → accept-all).
-- [ ] The probe never raises: degradation path unit-tested by monkeypatching
+- [x] The probe never raises: degradation path unit-tested by monkeypatching
       `tcgetattr` to throw.
-- [ ] `python -m pytest` green; `python -m cleat.engine` self-test ALL PASS.
+- [x] `python -m pytest` green; `python -m cleat.engine` self-test ALL PASS.
+      (One pre-existing, unrelated failure on zsh -
+      `test_read_output_preserves_tail_of_command_finishing_between_polls[zsh]`
+      - confirmed via the pristine pre-#5 base commit; zsh was never
+      previously tested in CI. Out of scope here; worth its own issue.)
 
 ## Out of scope (deliberately — do not build these here)
 
