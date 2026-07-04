@@ -435,6 +435,46 @@ class Engine:
                                    "completed": done})
 
     @_serialized
+    def wait_for(self, timeout=30.0) -> dict:
+        """Block until the session needs attention - state leaves "running" -
+        or `timeout` elapses. Returns {output, exit_code, completed, state},
+        the same shape as read_output(), but waits on the state oracle
+        directly instead of an idle-silence window: no polling, no guessed
+        intervals. Returns immediately if the session isn't "running" when
+        called (e.g. already sitting at a REPL prompt)."""
+        if not self._alive:
+            raise RuntimeError("engine not started (or already closed)")
+        with self._cond:
+            end = time.monotonic() + timeout
+            while self._alive and self._probe_state() == "running":
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(remaining)
+            # A command that just finished can flash a WRONG non-"running"
+            # state for one beat: e.g. zsh restores its own ZLE raw mode
+            # (icanon off) as part of reclaiming the foreground pgid the
+            # instant the child exits, but its precmd hook's D/A marks -
+            # which is what actually closes the record - hasn't reached us
+            # yet. That race only exists once the SHELL itself owns the
+            # terminal again (fg == shell pid); a real awaiting-input/
+            # password wait keeps a CHILD in the foreground the whole time,
+            # so this never delays those. Bounded short either way.
+            try:
+                settle_end = min(end, time.monotonic() + 0.2)
+                while (self._alive and not self._struct.idle
+                       and os.tcgetpgrp(self._proc.fd) == self._shell_pid
+                       and time.monotonic() < settle_end):
+                    self._cond.wait(settle_end - time.monotonic())
+            except OSError:
+                pass
+            raw = self._drain()
+            done = self._struct.idle and self._rec_total() > 0
+            exit_code = self._records[-1].exit_code if done else None
+            return self._augment({"output": _clean(raw), "exit_code": exit_code,
+                                   "completed": done})
+
+    @_serialized
     def read_screen(self, settle=0.3, timeout=1.0) -> dict:
         """Return the rendered virtual screen (what the terminal looks like now)
         plus the cursor [x, y] and state. Briefly waits for output to settle
@@ -501,6 +541,14 @@ if __name__ == "__main__":
         # long-running but silent until the end: should COMPLETE (no false idle).
         r = eng.run_command("sleep 1; echo woke", timeout=5)
         check("slow-but-completes", r["completed"] and r["stdout"] == "woke", str(r))
+
+        # wait_for: block past run_command's own timeout, no polling.
+        r = eng.run_command("sleep 1; echo waited", timeout=0.2)
+        check("wait_for setup (not completed yet)", not r["completed"], str(r))
+        r = eng.wait_for(timeout=5)
+        check("wait_for blocks until completion",
+              r["completed"] and "waited" in r["output"] and r["state"] == "idle",
+              str(r))
 
         # interactive REPL: run_command should NOT hang; returns completed=False.
         r = eng.run_command("python3", timeout=8)
