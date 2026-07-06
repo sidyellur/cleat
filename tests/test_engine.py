@@ -7,6 +7,7 @@ suite runs anywhere (CI included)."""
 import os
 import re
 import shutil
+import signal
 import subprocess
 import termios
 import threading
@@ -547,6 +548,26 @@ def test_concurrent_calls_serialized(bash_eng):
     for t in ts:
         t.join()
     assert errors == []
+
+
+def test_stale_altscreen_cleared_when_tui_dies_uncleanly(bash_eng):
+    # Issue #17: vim (or any TUI) killed without emitting its rmcup exit
+    # sequence (SIGKILL, crash) must not leave state=="tui" stuck forever -
+    # once a DIFFERENT, plain command takes over the foreground, the stale
+    # flag must be recognized as stale and cleared.
+    if not shutil.which("vim"):
+        pytest.skip("vim not installed")
+    bash_eng.run_command("vim -u NONE -N", timeout=5)
+    scr = bash_eng.read_screen()
+    assert scr["state"] == "tui"
+
+    with bash_eng._cond:
+        fg_pgid = os.tcgetpgrp(bash_eng._proc.fd)
+    os.killpg(fg_pgid, signal.SIGKILL)  # no rmcup - simulates an unclean death
+    time.sleep(0.5)                    # let the shell reclaim the terminal
+
+    r = bash_eng.run_command("sleep 0.5", timeout=0.2)
+    assert r["state"] == "running", f"stale altscreen misclassified state: {r}"
 
 
 def test_tui_renders_and_quits(bash_eng):
