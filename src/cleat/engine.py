@@ -158,7 +158,6 @@ class Engine:
                 break
             if not data:
                 break
-            self._answer_terminal_queries(data)
             with self._cond:
                 # Feed under the lock so struct state (commands_started), the
                 # raw buffer, and the screen advance atomically for readers.
@@ -169,6 +168,9 @@ class Engine:
                 altscreen_matches = _ALTSCREEN_RE.findall(data)
                 if altscreen_matches:
                     self._altscreen = altscreen_matches[-1] == b"h"
+                # Gated on struct/altscreen state AS OF THIS CHUNK (issue #16) -
+                # must run after the updates above, not before.
+                self._answer_terminal_queries(data)
                 try:
                     self._pyte.feed(data)
                 except Exception:
@@ -227,7 +229,28 @@ class Engine:
         Some shells/TUIs (notably fish 4.x) refuse to draw a prompt until the
         terminal answers DA1 / cursor-position / background-color queries. Under
         a bare PTY nobody answers, so they hang forever. We send minimal canned
-        replies. Harmless for shells that never ask (zsh/bash)."""
+        replies.
+
+        Gated (issue #16): a command's OWN stdout can contain these same byte
+        sequences - a `cat` on a binary/log file, a program that deliberately
+        prints them - and blindly pattern-matching raw output let that
+        command's own output forge input into the shell's stdin (a fake
+        cursor-position reply lands as if the human had typed it). We can't
+        attribute a byte sequence to "a real terminal query" vs. "a command's
+        output" at the byte level, so instead we only answer while a real
+        query is plausible: before the shell's very first prompt (fish's own
+        startup probing - the reason this responder exists) or while a
+        full-screen program legitimately owns the terminal (altscreen). Once
+        the shell has shown a prompt and isn't in altscreen, we no longer
+        answer - a TUI that queries before ever entering altscreen won't get
+        an answer either, but no case in the test suite needs that, and it's
+        the safer tradeoff.
+
+        Caller holds _cond and has already fed `data` into self._struct and
+        updated self._altscreen for this chunk, so both reflect state
+        INCLUDING this read, not a chunk behind."""
+        if self._struct.prompts_seen > 0 and not self._altscreen:
+            return
         try:
             if b"\x1b[c" in data or b"\x1b[0c" in data:
                 self._proc.write(b"\x1b[?62;c")                      # DA1
