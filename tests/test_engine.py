@@ -351,6 +351,30 @@ def test_memory_bounded(bash_eng):
     assert len(bash_eng._raw) <= 2 * _MAX_RAW and bash_eng._base > 0
 
 
+def test_memory_bounded_during_single_large_output_command(bash_eng):
+    # Issue #15: unlike test_memory_bounded (separate commands, cursor
+    # advances between them), this streams ~5 MiB in ONE command while
+    # run_command is still parked in its wait loop. Both the raw byte
+    # buffer and the in-flight stdout accumulator must stay bounded WHILE
+    # the command is still running, not just after it completes.
+    done = threading.Event()
+
+    def runner():
+        bash_eng.run_command("yes | head -c 5000000", timeout=20)
+        done.set()
+
+    t = threading.Thread(target=runner)
+    t.start()
+    max_raw = max_stdout = 0
+    while not done.is_set():
+        max_raw = max(max_raw, len(bash_eng._raw))
+        max_stdout = max(max_stdout, len(bash_eng._struct._stdout))
+        time.sleep(0.02)
+    t.join()
+    assert max_raw <= 2 * _MAX_RAW, f"raw buffer grew unbounded mid-command: {max_raw}"
+    assert max_stdout <= 2 * _MAX_RAW, f"stdout accumulator grew unbounded mid-command: {max_stdout}"
+
+
 def test_concurrent_calls_serialized(bash_eng):
     errors = []
 

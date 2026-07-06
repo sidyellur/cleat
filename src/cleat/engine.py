@@ -173,12 +173,21 @@ class Engine:
                     self._pyte.feed(data)
                 except Exception:
                     pass  # never let a rendering hiccup kill the read loop
-                # Bound memory: drop the consumed raw prefix + evict old records.
+                # Bound memory: keep only the most recent _MAX_RAW bytes,
+                # regardless of whether a cursor has consumed them yet
+                # (issue #15) - during a single long/large-output command
+                # nobody drains via _cursor until it completes, so gating the
+                # drop on "consumed" bytes let this grow unbounded for the
+                # whole command. A cursor that pointed into now-dropped bytes
+                # is clamped forward to _base; that consumer simply missed
+                # some of the bounded-out middle, same tradeoff as _records
+                # eviction below.
                 if len(self._raw) > _MAX_RAW:
-                    drop = self._cursor - self._base
-                    if drop > 0:
-                        del self._raw[:drop]
-                        self._base += drop
+                    drop = len(self._raw) - _MAX_RAW
+                    del self._raw[:drop]
+                    self._base += drop
+                    if self._cursor < self._base:
+                        self._cursor = self._base
                 if len(self._records) > _MAX_RECORDS:
                     drop = len(self._records) - _MAX_RECORDS
                     del self._records[:drop]
@@ -387,11 +396,15 @@ class Engine:
                 self._cursor = self._total()
                 result = {"stdout": rec.stdout, "exit_code": rec.exit_code,
                           "completed": True}
+                if rec.truncated:
+                    result["truncated"] = True
             else:
                 # Not completed: hand back the clean post-C output if we have it.
                 self._cursor = self._total()
                 result = {"stdout": self._struct.partial_stdout(),
                           "exit_code": None, "completed": False}
+                if self._struct.stdout_truncated:
+                    result["truncated"] = True
             result = self._augment(result)
 
         # files-touched: diff the watched tree once the command has finished.

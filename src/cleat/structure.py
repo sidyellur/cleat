@@ -65,11 +65,23 @@ _ANSI_RE = re.compile(
 )
 
 
+# Cap a single in-flight command's stdout accumulator (issue #15): without
+# this, a command like `yes | head -c 2000000000` grows self._stdout without
+# bound for the ENTIRE duration of the command, since nothing drains it until
+# the D mark closes the record. Past the cap, keep a head window (context from
+# the start of the output) and a rolling tail window (the most recent bytes),
+# dropping the middle - callers are told via `truncated`.
+_MAX_STDOUT = 1 << 20  # 1 MiB
+_STDOUT_HEAD = _MAX_STDOUT // 2
+_STDOUT_TAIL = _MAX_STDOUT // 2
+
+
 @dataclass
 class CommandRecord:
     """One command's worth of facts, dug out of the byte soup."""
     stdout: str
     exit_code: Optional[int]
+    truncated: bool = False
 
     def as_dict(self):
         return asdict(self)
@@ -91,7 +103,11 @@ class StructureSource:
     def __init__(self, nonce=None, expect_unnonced_marks=False):
         self._buf = b""          # bytes not yet resolved (may hold a partial mark)
         self._state = "IDLE"     # IDLE | RUNNING
-        self._stdout = b""       # raw stdout accumulated while RUNNING
+        self._stdout = b""       # raw stdout accumulated while RUNNING (tail
+                                  # window only, once truncated - see _content)
+        self._stdout_head = None  # bytes: captured once, first _STDOUT_HEAD
+                                   # bytes, or None if never truncated
+        self._stdout_total = 0     # total bytes seen for the in-flight command
         self._nonce = nonce      # expected k=<hex> on C/D/A marks; None = accept all
         # Some shells have their OWN native OSC 133 emitter running alongside
         # ours (fish >= 4) that will never carry our nonce - that's expected,
@@ -106,7 +122,26 @@ class StructureSource:
 
     def partial_stdout(self) -> str:
         """Cleaned stdout captured so far for an in-flight command (post-C)."""
-        return _clean(self._stdout)
+        return _clean(self._current_stdout_bytes())
+
+    @property
+    def stdout_truncated(self) -> bool:
+        """True once the in-flight command's stdout has exceeded the cap."""
+        return self._stdout_head is not None
+
+    def _current_stdout_bytes(self) -> bytes:
+        """Compose the captured stdout, head+tail if truncated. Caller holds
+        no lock requirement beyond whatever the engine already uses."""
+        if self._stdout_head is None:
+            return bytes(self._stdout)
+        omitted = self._stdout_total - len(self._stdout_head) - len(self._stdout)
+        marker = f"\n...[cleat: {omitted} bytes omitted]...\n".encode()
+        return self._stdout_head + marker + bytes(self._stdout)
+
+    def _reset_stdout(self):
+        self._stdout = b""
+        self._stdout_head = None
+        self._stdout_total = 0
 
     @property
     def idle(self) -> bool:
@@ -146,9 +181,19 @@ class StructureSource:
         return completed
 
     def _content(self, chunk: bytes):
-        """Bytes between marks: stdout only while a command is RUNNING."""
-        if self._state == "RUNNING" and chunk:
-            self._stdout += chunk
+        """Bytes between marks: stdout only while a command is RUNNING.
+        Bounded (issue #15): past _MAX_STDOUT, keep a fixed head window plus
+        a rolling tail window instead of growing for the whole command."""
+        if self._state != "RUNNING" or not chunk:
+            return
+        self._stdout += chunk
+        self._stdout_total += len(chunk)
+        if self._stdout_head is None:
+            if len(self._stdout) > _MAX_STDOUT:
+                self._stdout_head = bytes(self._stdout[:_STDOUT_HEAD])
+                self._stdout = self._stdout[-_STDOUT_TAIL:]
+        elif len(self._stdout) > _STDOUT_TAIL:
+            self._stdout = self._stdout[-_STDOUT_TAIL:]
 
     def _mark(self, payload: str):
         """Apply one mark's payload; return a CommandRecord if one just closed."""
@@ -171,7 +216,7 @@ class StructureSource:
 
         if code == "C":                      # command output begins
             self._state = "RUNNING"
-            self._stdout = b""
+            self._reset_stdout()
             self.commands_started += 1
             return None
 
@@ -182,9 +227,11 @@ class StructureSource:
             if len(parts) > 1 and re.fullmatch(r"-?\d+", parts[1]):
                 exit_code = int(parts[1])
             if self._state == "RUNNING":
-                rec = CommandRecord(stdout=_clean(self._stdout), exit_code=exit_code)
+                rec = CommandRecord(stdout=_clean(self._current_stdout_bytes()),
+                                     exit_code=exit_code,
+                                     truncated=self.stdout_truncated)
                 self._state = "IDLE"
-                self._stdout = b""
+                self._reset_stdout()
                 return rec
             # IDLE D. The shell's first precmd emits a spurious D;0 BEFORE the
             # first prompt is shown (no A, no command yet) - ignore that. But a D
