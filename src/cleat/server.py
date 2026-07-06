@@ -50,9 +50,16 @@ _engine = None
 
 
 def _get_engine() -> Engine:
-    """Lazily start the persistent shell on first use, then reuse it."""
+    """Lazily start the persistent shell on first use, then reuse it - but
+    respawn a fresh one if the previous shell died (issue #19). The reader
+    loop flips Engine._alive to False when the shell exits/crashes; without
+    this check every call after that hit the same dead engine and raised
+    "engine not started (or already closed)" forever, with no recovery short
+    of restarting the whole MCP server process."""
     global _engine
-    if _engine is None:
+    if _engine is None or not _engine._alive:
+        if _engine is not None:
+            _engine.close()  # release its injected temp rcfile dir before replacing
         _engine = Engine().start()
     return _engine
 
