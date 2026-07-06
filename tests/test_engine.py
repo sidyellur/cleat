@@ -345,6 +345,57 @@ def test_ctrl_c_interrupts(bash_eng):
     assert r["completed"] and r["exit_code"] is not None
 
 
+def test_terminal_query_bytes_in_command_output_not_answered(bash_eng):
+    # Issue #16: a command's OWN stdout containing what looks like a terminal
+    # query byte sequence must NOT be treated as a genuine query and trigger
+    # cleat to write a reply into the shell's stdin - that's spurious input
+    # forged by the command's own output.
+    writes = []
+    real_write = bash_eng._proc.write
+
+    def spy_write(data):
+        writes.append(data)
+        return real_write(data)
+
+    bash_eng._proc.write = spy_write
+    r = bash_eng.run_command(r"printf '\033[6n'")
+    assert r["completed"]
+    replies = [w for w in writes if w == b"\x1b[1;1R"]
+    assert replies == [], f"query reply was injected into stdin: {writes}"
+
+
+def test_terminal_query_gate_blocks_after_first_prompt_outside_altscreen(bash_eng):
+    # Direct unit check of the gate itself, independent of real shell timing.
+    bash_eng._struct.prompts_seen = 1
+    bash_eng._altscreen = False
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(b"\x1b[6n")
+    assert writes == []
+
+
+def test_terminal_query_gate_allows_before_first_prompt(bash_eng):
+    # The one legitimate case this responder exists for: a shell/TUI probing
+    # terminal capabilities before it has ever shown a prompt (fish's own
+    # startup DA1 query).
+    bash_eng._struct.prompts_seen = 0
+    bash_eng._altscreen = False
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(b"\x1b[6n")
+    assert writes == [b"\x1b[1;1R"]
+
+
+def test_terminal_query_gate_allows_during_altscreen(bash_eng):
+    # A full-screen program legitimately owns the terminal and may query it.
+    bash_eng._struct.prompts_seen = 5
+    bash_eng._altscreen = True
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(b"\x1b[6n")
+    assert writes == [b"\x1b[1;1R"]
+
+
 def test_memory_bounded(bash_eng):
     for _ in range(8):
         bash_eng.run_command("head -c 200000 /dev/zero | tr '\\0' x", timeout=8)
