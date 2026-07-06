@@ -75,6 +75,28 @@ def test_engine_inject_false_unaffected(request):
     assert eng._struct.spoofed_marks == 0
 
 
+# -- session nonce not left readable on disk (issue #21) --------------------
+_INJECTED_RCFILE_NAME = {"bash": "bashrc", "zsh": ".zshrc", "fish": "marks.fish"}
+
+
+def test_injected_rcfile_unlinked_after_shell_reads_it(eng):
+    # A same-uid child process spawned in the session can read the injected
+    # rcfile's PATH via /proc/<pid>/cmdline (bash/fish carry it directly in
+    # argv). If the file is still ON DISK at that point, the child can open
+    # it and read the nonce straight out, then forge fully-authenticated
+    # marks. By the time start() returns (the shell has produced its first
+    # output, meaning it already fully read the rcfile during its own
+    # startup), the file must already be gone.
+    shell_base = eng.shell.rsplit("/", 1)[-1]
+    rc_path = os.path.join(eng._inject_dir, _INJECTED_RCFILE_NAME[shell_base])
+    assert not os.path.exists(rc_path), \
+        "injected rcfile must be unlinked once the shell has read it"
+    # The shell must still work normally - it already read the (now-deleted)
+    # file's content into its own hook functions before we removed it.
+    r = eng.run_command("echo hi")
+    assert r["stdout"] == "hi" and r["exit_code"] == 0 and r["completed"]
+
+
 # -- core behaviors, every supported shell ---------------------------------
 def test_echo(eng):
     assert eng.run_command("echo hi") == {

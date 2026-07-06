@@ -132,6 +132,14 @@ false alarm on every fish command. `run_command` surfaces the real count as
 `spoofed_marks` in its result (only when it's nonzero), so an agent can tell
 when a program it ran tried to lie about how it finished.
 
+The nonce itself is embedded in a temp rcfile at session startup (bash's
+`--rcfile`, fish's `-C 'source ...'`, zsh's `$ZDOTDIR`) — its path stays
+visible in the shell's own argv for the life of the process. `cleat` removes
+that file from disk as soon as the shell has read it (before it ever shows a
+prompt), so a same-uid child process spawned later in the session can't open
+the path and read the nonce out, even if it discovers it via
+`/proc/<pid>/cmdline`.
+
 ## Caveats
 
 - **POSIX only.** Uses `pty`/`termios`; no Windows.
