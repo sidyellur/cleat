@@ -44,6 +44,7 @@ read — instead of guessed from output timing:
 | `awaiting-input` | a REPL/prompt is blocked on stdin | drive it with `send_keys` |
 | `password` | a secret prompt (`sudo`, `read -s`) is waiting, echo off | **stop** — only send input here with the human's explicit consent |
 | `tui` | a full-screen program (vim, top, less) owns the terminal | use `read_screen`/`send_keys`, not `run_command` |
+| `possibly-awaiting-input` | best-effort (Linux only): looks like a plain `read`/`cat`-style canonical-mode prompt, not a busy program | try `send_keys` with a line of input |
 
 ## Install
 
