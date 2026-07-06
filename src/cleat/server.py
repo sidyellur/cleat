@@ -27,6 +27,10 @@ directly instead of polling-and-hoping:
     "tui"              a full-screen program (vim, top, less) owns the terminal;
                        use read_screen/send_keys, not run_command.
     "running"          a child is executing; poll read_output or wait.
+    "possibly-awaiting-input"  best-effort (Linux only): looks like a plain
+                       `read`/`cat`-style canonical-mode prompt rather than
+                       a busy program - try send_keys() with a line of input.
+
 
 run_command also carries "spoofed_marks" (only when > 0): a program run in
 this session tried to forge an OSC 133 completion mark. It can't alter the

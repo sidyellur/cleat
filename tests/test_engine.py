@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-from cleat.engine import Engine, _MAX_RAW
+from cleat.engine import Engine, _MAX_RAW, _blocked_on_read
 
 
 def _fish_supported(path):
@@ -248,6 +248,36 @@ def test_state_running_while_command_executes(eng):
     r = eng.run_command("sleep 3", timeout=0.5)
     assert not r["completed"]
     assert r["state"] == "running"
+
+
+def test_state_possibly_awaiting_input_on_canonical_read(bash_eng):
+    # Issue #27: a plain `read x` (or `cat` waiting on stdin) leaves the
+    # terminal in CANONICAL mode with echo on, so termios alone can't tell
+    # it apart from a genuinely busy program - it used to fall through to
+    # "running" and an agent polling read_output()/wait_for() would just
+    # time out, never learning it should send_keys() a line. Best-effort
+    # (Linux, via /proc/<pid>/wchan): if the foreground process is blocked
+    # in a read-like wait, surface a distinct "possibly-awaiting-input"
+    # instead.
+    r = bash_eng.run_command("read x", timeout=2)
+    assert not r["completed"]
+    assert r["state"] == "possibly-awaiting-input"
+    bash_eng.send_keys("hi", enter=True)  # drain so teardown is clean
+
+
+def test_state_still_running_for_sleep_not_possibly_awaiting_input(bash_eng):
+    # A real sleep() is ALSO a blocking wait, but a different one
+    # (hrtimer_nanosleep, not a read) - must not be misclassified either.
+    r = bash_eng.run_command("sleep 3", timeout=0.5)
+    assert not r["completed"]
+    assert r["state"] == "running"
+
+
+def test_blocked_on_read_degrades_gracefully_for_unknown_pid():
+    # A pid with no /proc entry (or on a non-Linux platform) must never
+    # raise - this is a best-effort refinement, not a hard requirement.
+    assert _blocked_on_read(-1) is False
+    assert _blocked_on_read(2**30) is False
 
 
 def test_state_awaiting_input_in_repl(eng):

@@ -38,6 +38,11 @@ read), not guessed from output timing. See _probe_state() for the derivation
 and PLAN.md for the full rationale. "spoofed_marks" appears alongside it,
 but only when a program running in the session has tried to forge an OSC 133
 mark (see structure.py's nonce filtering).
+
+A 6th value, "possibly-awaiting-input", can also appear: a best-effort,
+Linux-only refinement (issue #27) for the one termios-level ambiguity the
+model above admits it can't resolve - a plain `read x`/`cat` waiting on
+stdin looks identical to a busy program by termios alone.
 """
 
 import os
@@ -66,6 +71,29 @@ _MAX_RECORDS = 256
 # screen still renders correctly either way, only the `state` probe misses a
 # beat until the next chunk arrives.
 _ALTSCREEN_RE = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
+
+# Kernel wait-channel names (issue #27) a process blocked reading from a tty
+# or pipe shows up under in /proc/<pid>/wchan on Linux - as opposed to, say,
+# a `sleep` (hrtimer_nanosleep) or a CPU-bound loop ("0"/no meaningful wchan).
+# This is best-effort: it needs kernel symbol info (CONFIG_KALLSYMS) to be
+# populated at all, isn't available on macOS, and only reflects the exact pid
+# checked (the first process in a multi-stage pipeline's process group, same
+# simplification the rest of the state probe already makes for "fg"). A miss
+# here just falls through to the existing "running" bucket - never a
+# regression, only a refinement of it.
+_WCHAN_BLOCKED_ON_READ = {"wait_woken", "tty_read", "n_tty_read", "read_chan",
+                           "pipe_read", "pipe_wait"}
+
+
+def _blocked_on_read(pgid):
+    """Best-effort Linux-only check: does the foreground process look like
+    it's blocked in a read-like wait? Returns False on ANY failure (non-
+    Linux, no /proc, permission, no kernel symbols) - see module comment."""
+    try:
+        with open(f"/proc/{pgid}/wchan") as f:
+            return f.read().strip() in _WCHAN_BLOCKED_ON_READ
+    except OSError:
+        return False
 
 
 def _serialized(method):
@@ -305,10 +333,21 @@ class Engine:
           3. password        - ECHO off, ICANON on (sudo, read -s, getpass).
           4. awaiting-input  - ICANON off: a readline/libedit line editor is
                                provably blocked on input.
-          5. running         - a child owns the terminal and none of the
+          5. possibly-awaiting-input - canonical mode (ICANON on, echo on),
+                               but the foreground process looks blocked in a
+                               read-like wait per /proc/<pid>/wchan
+                               (best-effort, Linux only - see
+                               _blocked_on_read). A plain `read x` or `cat`
+                               waiting on stdin leaves termios looking
+                               identical to a busy program, so this is a
+                               refinement on top of termios facts, not a
+                               replacement for them.
+          6. running         - a child owns the terminal and none of the
                                above matched. Honest residue: canonical-mode
                                `cat` waiting on stdin is indistinguishable
-                               from a busy program by termios alone.
+                               from a busy program by termios alone, and the
+                               wchan check above is best-effort (may not be
+                               available at all, e.g. on macOS).
 
         Never raises: if tcgetpgrp/tcgetattr fail (OSError/termios.error -
         e.g. the fd closed under us), degrade to idle/running from marks
@@ -326,6 +365,8 @@ class Engine:
                 return "password"
             if not icanon:
                 return "awaiting-input"
+            if _blocked_on_read(fg):
+                return "possibly-awaiting-input"
             return "running"
         except (OSError, termios.error):
             return "idle" if self._struct.idle else "running"
@@ -373,7 +414,8 @@ class Engine:
                            for input or still running. stdout is what we have so
                            far; follow up with send_keys()/read_output().
         state -> see _probe_state(): "idle"|"running"|"awaiting-input"|
-                 "password"|"tui", derived from termios/fg-pgid, not guessed.
+                 "password"|"tui"|"possibly-awaiting-input", derived from
+                 termios/fg-pgid, not guessed.
         spoofed_marks -> present (and >0) only if a program in the session
                           tried to forge an OSC 133 mark; see structure.py.
 
