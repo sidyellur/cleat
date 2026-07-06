@@ -83,3 +83,42 @@ def test_bash_rcfile_references_vendored_preexec_by_absolute_path():
         assert os.path.isabs(content.split("if [ -r '")[1].split("'")[0])
     finally:
         _cleanup(cleanup_dir)
+
+
+# -- login/profile files not sourced (issue #29) -----------------------------
+# cleat spawns a non-login shell, unlike a real terminal (Terminal.app/iTerm2
+# spawn login shells by default on macOS) - PATH/env set only in a login
+# shell's profile files (a common pattern, e.g. Homebrew's `brew shellenv` in
+# .zprofile) was silently absent in cleat sessions.
+
+def test_zsh_rcfile_sources_profile_and_login_files():
+    argv, env, cleanup_dir, nonce = prepare("/bin/zsh", {"HOME": "/home/x"})
+    try:
+        content = open(os.path.join(cleanup_dir, ".zshrc")).read()
+        assert 'source "$ZDOTDIR/.zprofile"' in content
+        assert 'source "$ZDOTDIR/.zlogin"' in content
+        # Order matches what a real login shell sources:
+        # .zshenv -> .zprofile -> .zshrc -> .zlogin. Search for the actual
+        # `source` lines, not bare substrings - this module's own
+        # explanatory comment mentions all four names in prose too.
+        assert (content.index('source "$ZDOTDIR/.zshenv"')
+                < content.index('source "$ZDOTDIR/.zprofile"')
+                < content.index('source "$ZDOTDIR/.zshrc"')
+                < content.index('source "$ZDOTDIR/.zlogin"'))
+    finally:
+        _cleanup(cleanup_dir)
+
+
+def test_bash_rcfile_sources_a_profile_style_file_too():
+    argv, env, cleanup_dir, nonce = prepare("/bin/bash", {"HOME": "/home/x"})
+    try:
+        rc_path = argv[argv.index("--rcfile") + 1]
+        content = open(rc_path).read()
+        # bash's own login-shell precedence: .bash_profile, else
+        # .bash_login, else .profile (first one found, not all three).
+        assert ".bash_profile" in content
+        assert ".bash_login" in content
+        assert ".profile" in content
+        assert "$HOME/.bashrc" in content
+    finally:
+        _cleanup(cleanup_dir)
