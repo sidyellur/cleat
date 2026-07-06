@@ -345,6 +345,52 @@ def test_ctrl_c_interrupts(bash_eng):
     assert r["completed"] and r["exit_code"] is not None
 
 
+def test_query_responder_write_serialized_with_api_writes(bash_eng):
+    # Issue #25: _answer_terminal_queries writes to the PTY master from the
+    # reader thread; run_command/send_keys write to it from the API thread
+    # while holding _cond. If the reader thread's write happens OUTSIDE
+    # _cond, that lock doesn't actually serialize the two write paths - a
+    # concurrent attempt to acquire _cond from another thread would succeed
+    # even while the query-responder write is in flight. Prove mutual
+    # exclusion directly: make the query-responder's specific write pause
+    # until a second thread has tried (and, if truly serialized, failed) to
+    # grab _cond in the meantime.
+    write_started = threading.Event()
+    write_can_finish = threading.Event()
+    query_write_seen = threading.Event()
+    lock_was_held_during_write = threading.Event()
+    real_write = bash_eng._proc.write
+
+    def spy_write(data):
+        if data == b"\x1b[1;1R":
+            query_write_seen.set()
+            write_started.set()
+            write_can_finish.wait(timeout=5.0)
+        return real_write(data)
+
+    bash_eng._proc.write = spy_write
+
+    def watcher():
+        if not write_started.wait(timeout=5.0):
+            write_can_finish.set()
+            return
+        acquired = bash_eng._cond.acquire(blocking=False)
+        if acquired:
+            bash_eng._cond.release()
+        else:
+            lock_was_held_during_write.set()
+        write_can_finish.set()
+
+    t = threading.Thread(target=watcher)
+    t.start()
+    bash_eng.run_command(r"printf '\033[6n'", timeout=5)
+    t.join(timeout=5)
+
+    assert query_write_seen.is_set(), "query-responder write never triggered"
+    assert lock_was_held_during_write.is_set(), \
+        "query-responder's PTY write was not serialized under _cond"
+
+
 def test_memory_bounded(bash_eng):
     for _ in range(8):
         bash_eng.run_command("head -c 200000 /dev/zero | tr '\\0' x", timeout=8)

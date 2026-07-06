@@ -158,8 +158,14 @@ class Engine:
                 break
             if not data:
                 break
-            self._answer_terminal_queries(data)
             with self._cond:
+                # _answer_terminal_queries writes to the same PTY master
+                # run_command/send_keys write to under this same lock
+                # (issue #25) - do it here, inside _cond, not before
+                # acquiring it, so the two write paths are actually
+                # serialized instead of merely relying on os.write()
+                # happening to be atomic at the kernel level.
+                self._answer_terminal_queries(data)
                 # Feed under the lock so struct state (commands_started), the
                 # raw buffer, and the screen advance atomically for readers.
                 recs = self._struct.feed(data)
