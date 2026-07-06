@@ -321,6 +321,25 @@ def test_probe_state_degrades_on_tcgetpgrp_failure(bash_eng, monkeypatch):
 
 
 # -- specific cases (bash) -------------------------------------------------
+def test_run_command_raises_when_not_idle(bash_eng):
+    # Issue #18: run_command must not silently forward a new command into a
+    # REPL/TUI that isn't idle - a command sent there lands INSIDE it (e.g.
+    # `ls` typed into python3's `>>>` prompt), producing a confusing timeout
+    # instead of a clear error the agent can act on.
+    r = bash_eng.run_command("python3", timeout=5)
+    assert not r["completed"] and r["state"] == "awaiting-input"
+    with pytest.raises(RuntimeError, match="awaiting-input"):
+        bash_eng.run_command("ls")
+    bash_eng.send_keys("exit()", enter=True)  # clean teardown
+
+
+def test_run_command_allowed_again_once_idle(bash_eng):
+    bash_eng.run_command("python3", timeout=5)
+    bash_eng.send_keys("exit()", enter=True)
+    r = bash_eng.run_command("echo back")
+    assert r == {"stdout": "back", "exit_code": 0, "completed": True, "state": "idle"}
+
+
 def test_bash_subshell_exit_recovered(bash_eng):
     # First token '(' emits no C mark under bash-preexec; exit code still recovered.
     r = bash_eng.run_command("(exit 7)", timeout=4)

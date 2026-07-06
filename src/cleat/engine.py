@@ -376,9 +376,23 @@ class Engine:
                  "password"|"tui", derived from termios/fg-pgid, not guessed.
         spoofed_marks -> present (and >0) only if a program in the session
                           tried to forge an OSC 133 mark; see structure.py.
+
+        Raises RuntimeError if the session isn't idle (issue #18): sending a
+        new command into an open REPL/TUI/prompt lands it INSIDE that
+        program instead of at the shell, which just times out confusingly.
+        Use send_keys() to drive whatever's open, or wait_for()/read_output()
+        until it's idle again, before calling run_command().
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
+        with self._cond:
+            state = self._probe_state()
+            if state != "idle":
+                raise RuntimeError(
+                    f"session is in state {state!r}, not idle - use "
+                    "send_keys() to drive it, or wait_for()/read_output() "
+                    "until it's idle, before calling run_command() again"
+                )
         before = trunc_before = None
         if self._watch_root:
             before, trunc_before = filewatch.snapshot(self._watch_root)
