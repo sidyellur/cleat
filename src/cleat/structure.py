@@ -39,6 +39,24 @@ un-nonced OSC 133 emitter alongside ours (fish >= 4), and that's expected
 telemetry, not tampering, so it shouldn't trip a tamper counter. A mark with a
 *wrong* `k=` value is always counted regardless - only a deliberate attempt to
 impersonate our scheme would bother including one.
+
+Known false-positive source (issue #20): the injected rcfile re-sources the
+user's OWN .zshrc/.bashrc, which may itself install ambient, un-nonced OSC
+133-alike shell integration (iTerm2/VS Code/Kitty/WezTerm) if it thinks it's
+running inside its real host terminal - inject.py strips the common
+terminal-identity env vars those tools gate on (TERM_PROGRAM,
+ITERM_SESSION_ID, VSCODE_*, KITTY_*, WEZTERM_*) before spawning, which
+covers integrations that check those vars. There is deliberately NO
+position/content-based heuristic here (e.g. "only count marks that appear
+mid-command") - such a mark can legitimately land in exactly the same spot a
+real forgery would (an ambient integration's own precmd/preexec hook can
+fire before or after cleat's, depending on registration order, so its
+un-nonced marks can appear anywhere relative to cleat's own C/D), so trying
+to classify by position would either still flag legitimate ambient marks or
+blind spoofed_marks to the exact forged-mark pattern this file's own tests
+guard against. An integration that installs unconditionally regardless of
+env vars can still produce a false positive; that residual gap is a known,
+accepted limitation rather than something closeable at this layer.
 """
 
 import re

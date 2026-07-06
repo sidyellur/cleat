@@ -93,6 +93,26 @@ end
 '''
 
 
+# Terminal-identity env vars that ambient third-party shell integration
+# (iTerm2, VS Code, Kitty, WezTerm) gates its own self-install on - they emit
+# their OWN un-nonced OSC 133 marks when they think they're running inside
+# their real host terminal. Since these vars are inherited from whatever
+# process spawned the cleat/MCP-server process itself (its own outer
+# terminal, if any), and the injected rcfile re-sources the user's REAL
+# .zshrc/.bashrc, those integrations happily self-install here too even
+# though this synthetic PTY session isn't actually their host terminal -
+# causing legitimate ambient marks to be misread as forged ones and
+# incrementing spoofed_marks on essentially every command (issue #20).
+# Stripping these before spawning gives them an accurate signal instead.
+_AMBIENT_INTEGRATION_ENV_VARS = (
+    "TERM_PROGRAM", "TERM_PROGRAM_VERSION",   # generic; also gates VS Code/iTerm2
+    "ITERM_SESSION_ID", "ITERM_PROFILE",       # iTerm2
+    "VSCODE_INJECTION", "VSCODE_PID",          # VS Code
+    "KITTY_WINDOW_ID", "KITTY_PID",            # Kitty
+    "WEZTERM_EXECUTABLE", "WEZTERM_PANE",      # WezTerm
+)
+
+
 def _write(dirpath, name, content):
     path = os.path.join(dirpath, name)
     with open(path, "w") as f:
@@ -106,6 +126,12 @@ def prepare(shell, base_env):
     call, or None for an unknown shell (nothing was injected)."""
     base = os.path.basename(shell)
     env = dict(base_env)
+    if base in ("zsh", "bash", "fish"):
+        # Only the shells whose rcfile we actually re-source the user's own
+        # config in (and only when we're doing nonce authentication at all) -
+        # see _AMBIENT_INTEGRATION_ENV_VARS above.
+        for var in _AMBIENT_INTEGRATION_ENV_VARS:
+            env.pop(var, None)
 
     if base == "zsh":
         nonce = secrets.token_hex(8)
