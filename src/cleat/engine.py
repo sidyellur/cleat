@@ -204,6 +204,7 @@ class Engine:
     def __exit__(self, *exc):
         self.close()
 
+    @_serialized
     def resize(self, cols, rows):
         """Resize both the PTY and the virtual screen so TUIs relay out."""
         with self._cond:
@@ -215,8 +216,14 @@ class Engine:
             self._screen.resize(rows, cols)
         return {"cols": cols, "rows": rows}
 
+    @_serialized
     def set_watch_root(self, path):
-        """Enable/disable the files-touched feature. path='' or None disables."""
+        """Enable/disable the files-touched feature. path='' or None disables.
+
+        @_serialized (issue #26): this shares _api_lock with run_command, so
+        a watch_files() call can't land mid-command and pull the rug out
+        from under an in-flight run_command's before/after filewatch
+        snapshots - see run_command's own captured-once watch_root use."""
         self._watch_root = os.path.abspath(path) if path else None
         return {"watch_root": self._watch_root}
 
@@ -347,9 +354,15 @@ class Engine:
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
+        # Capture watch_root ONCE and reuse it for both snapshots (issue
+        # #26): even with set_watch_root now @_serialized (so it can't
+        # mutate self._watch_root mid-command), re-reading the attribute a
+        # second time after the command finishes is needless indirection -
+        # diffing the same root before/after is the whole point.
+        watch_root = self._watch_root
         before = trunc_before = None
-        if self._watch_root:
-            before, trunc_before = filewatch.snapshot(self._watch_root)
+        if watch_root:
+            before, trunc_before = filewatch.snapshot(watch_root)
         with self._cond:
             start_rc = self._rec_total()
             start_started = self._struct.commands_started
@@ -396,7 +409,7 @@ class Engine:
 
         # files-touched: diff the watched tree once the command has finished.
         if before is not None and result["completed"]:
-            after, trunc_after = filewatch.snapshot(self._watch_root)
+            after, trunc_after = filewatch.snapshot(watch_root)
             changed = filewatch.diff(before, after)
             if trunc_before or trunc_after:
                 changed["truncated"] = True  # tree too big; result unreliable
