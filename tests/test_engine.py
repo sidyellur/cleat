@@ -338,6 +338,37 @@ def test_files_changed(bash_eng, tmp_path):
     assert r["files_changed"]["created"] == [str(tmp_path / "created.txt")]
 
 
+def test_watch_root_change_serialized_against_inflight_run_command(bash_eng, tmp_path):
+    # Issue #26: set_watch_root wasn't @_serialized, so it could mutate
+    # self._watch_root WHILE an in-flight run_command's before-snapshot was
+    # already taken against the OLD root - the after-snapshot would then
+    # re-read the NEW root, diffing two unrelated directories into garbage.
+    # @_serialized makes set_watch_root block behind the in-flight
+    # run_command (both share _api_lock), so its mutation can't land until
+    # the command that's already using the old root has finished.
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    bash_eng.set_watch_root(str(dir_a))
+
+    result = {}
+
+    def runner():
+        result["r"] = bash_eng.run_command(
+            f"sleep 0.3; touch {dir_a}/created.txt", timeout=5)
+
+    t = threading.Thread(target=runner)
+    t.start()
+    time.sleep(0.1)  # run_command has taken its before-snapshot against dir_a by now
+    bash_eng.set_watch_root(str(dir_b))  # attempted race
+    t.join()
+
+    fc = result["r"].get("files_changed", {})
+    assert fc.get("created") == [str(dir_a / "created.txt")], \
+        f"watch-root race corrupted the diff: {fc}"
+
+
 def test_ctrl_c_interrupts(bash_eng):
     r = bash_eng.run_command("sleep 30", timeout=1.0)
     assert not r["completed"]
