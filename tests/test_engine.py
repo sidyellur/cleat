@@ -477,6 +477,31 @@ def test_terminal_query_gate_allows_during_altscreen(bash_eng):
     assert writes == [b"\x1b[1;1R"]
 
 
+def test_run_command_default_stdout_trimmed_not_exact(bash_eng):
+    # Default `stdout` stays exactly as documented/tested today - trimmed for
+    # readability - and carries no stdout_exact key unless opted in.
+    r = bash_eng.run_command(r"printf 'a\n\n\n'")
+    assert r["stdout"] == "a"
+    assert "stdout_exact" not in r
+
+
+def test_run_command_exact_preserves_trailing_newlines(bash_eng):
+    # Issue #22 repro: printf 'a\n\n\n' must be recoverable byte-exact via the
+    # opt-in `exact` flag, without changing the default `stdout` field.
+    r = bash_eng.run_command(r"printf 'a\n\n\n'", exact=True)
+    assert r["stdout"] == "a"
+    assert r["stdout_exact"] == "a\n\n\n"
+
+
+def test_run_command_exact_preserves_trailing_spaces(bash_eng):
+    # Issue #22 repro: printf '  x  ' loses trailing spaces in the cleaned
+    # field (rstrip trims the tail; leading spaces - not newlines - already
+    # survive _clean's strip("\n")); `exact=True` recovers them exactly.
+    r = bash_eng.run_command("printf '  x  '", exact=True)
+    assert r["stdout"] == "  x"
+    assert r["stdout_exact"] == "  x  "
+
+
 def test_memory_bounded(bash_eng):
     for _ in range(8):
         bash_eng.run_command("head -c 200000 /dev/zero | tr '\\0' x", timeout=8)

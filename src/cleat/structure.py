@@ -100,6 +100,8 @@ class CommandRecord:
     stdout: str
     exit_code: Optional[int]
     truncated: bool = False
+    stdout_exact: str = ""  # byte-exact (modulo ANSI-strip) counterpart to
+                             # `stdout` - see _clean_exact() (issue #22)
 
     def as_dict(self):
         return asdict(self)
@@ -109,12 +111,27 @@ class CommandRecord:
 
 
 def _clean(raw: bytes) -> str:
-    """ANSI-strip + normalize newlines -> the clean sticky-note text."""
+    """ANSI-strip + normalize newlines -> the clean sticky-note text.
+
+    NOT byte-exact: trims a leading newline some shells (e.g. fish's native C
+    mark) leak from the cursor repaint just before output, and rstrips the
+    tail for readability. Genuine leading/trailing whitespace or blank lines
+    the command itself printed are silently dropped too - see _clean_exact()
+    for a byte-exact alternative (issue #22)."""
     txt = _ANSI_RE.sub(b"", raw)
     txt = txt.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    # strip("\n") drops a leading newline some shells (e.g. fish's native C mark)
-    # leak from the cursor repaint just before output; rstrip() trims the tail.
     return txt.decode("utf-8", "replace").strip("\n").rstrip()
+
+
+def _clean_exact(raw: bytes) -> str:
+    """ANSI-strip + normalize newlines ONLY - no trimming. Byte-exact (modulo
+    ANSI/OSC stripping) counterpart to _clean(), for callers who need the
+    command's real output including leading/trailing whitespace and blank
+    lines (issue #22: the default `stdout` field is cleaned for readability
+    and was never actually byte-exact, despite older docs claiming it was)."""
+    txt = _ANSI_RE.sub(b"", raw)
+    txt = txt.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return txt.decode("utf-8", "replace")
 
 
 class StructureSource:
@@ -160,6 +177,10 @@ class StructureSource:
         self._stdout = b""
         self._stdout_head = None
         self._stdout_total = 0
+
+    def partial_stdout_exact(self) -> str:
+        """Byte-exact (modulo ANSI-strip) counterpart to partial_stdout()."""
+        return _clean_exact(self._current_stdout_bytes())
 
     @property
     def idle(self) -> bool:
@@ -247,7 +268,8 @@ class StructureSource:
             if self._state == "RUNNING":
                 rec = CommandRecord(stdout=_clean(self._current_stdout_bytes()),
                                      exit_code=exit_code,
-                                     truncated=self.stdout_truncated)
+                                     truncated=self.stdout_truncated,
+                                     stdout_exact=_clean_exact(self._current_stdout_bytes()))
                 self._state = "IDLE"
                 self._reset_stdout()
                 return rec

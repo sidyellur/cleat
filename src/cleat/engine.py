@@ -406,7 +406,7 @@ class Engine:
 
     # -- the agent-facing API ----------------------------------------------
     @_serialized
-    def run_command(self, cmd, timeout=10.0, idle=0.4) -> dict:
+    def run_command(self, cmd, timeout=10.0, idle=0.4, exact=False) -> dict:
         """Run a command. Returns {stdout, exit_code, completed, state}.
 
         completed=True  -> a D mark closed the command; exit_code is real.
@@ -424,6 +424,13 @@ class Engine:
         program instead of at the shell, which just times out confusingly.
         Use send_keys() to drive whatever's open, or wait_for()/read_output()
         until it's idle again, before calling run_command().
+
+        exact -> stdout is ANSI-stripped AND trimmed for readability (a
+                 leading newline some shells leak, trailing whitespace) - it
+                 is NOT byte-exact. Pass exact=True to also get
+                 stdout_exact: ANSI-stripped only, no trimming - the
+                 command's real output including leading/trailing whitespace
+                 and blank lines (issue #22).
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
@@ -477,6 +484,8 @@ class Engine:
                           "completed": True}
                 if rec.truncated:
                     result["truncated"] = True
+                if exact:
+                    result["stdout_exact"] = rec.stdout_exact
             else:
                 # Not completed: hand back the clean post-C output if we have it.
                 self._cursor = self._total()
@@ -484,6 +493,8 @@ class Engine:
                           "exit_code": None, "completed": False}
                 if self._struct.stdout_truncated:
                     result["truncated"] = True
+                if exact:
+                    result["stdout_exact"] = self._struct.partial_stdout_exact()
             result = self._augment(result)
 
         # files-touched: diff the watched tree once the command has finished.
