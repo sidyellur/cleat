@@ -1,6 +1,6 @@
 """Unit tests for the OSC 133 parser - pure, fast, no PTY."""
 
-from cleat.structure import StructureSource, _clean
+from cleat.structure import StructureSource, _clean, _MAX_STDOUT
 
 
 def _pairs(recs):
@@ -176,3 +176,38 @@ def test_expect_unnonced_marks_false_by_default():
     recs = src.feed(b"\x1b]133;C\x07x\x1b]133;D;0\x07")
     assert recs == []
     assert src.spoofed_marks == 2
+
+
+# -- unbounded stdout accumulator (issue #15) --------------------------------
+
+def test_stdout_capped_during_single_command():
+    # A single command's stdout must not grow without bound while RUNNING -
+    # feeding it well past _MAX_STDOUT must keep the accumulator bounded, not
+    # balloon to the full size of whatever the command printed.
+    src = StructureSource()
+    src.feed(b"\x1b]133;C\x07")
+    chunk = b"x" * 65536
+    for _ in range((_MAX_STDOUT // len(chunk)) * 3):
+        src.feed(chunk)
+        assert len(src._stdout) <= 2 * _MAX_STDOUT
+    recs = src.feed(b"\x1b]133;D;0\x07")
+    assert len(recs) == 1
+    assert recs[0].truncated is True
+    assert len(recs[0].stdout) < 3 * len(chunk) * (_MAX_STDOUT // len(chunk))
+
+
+def test_stdout_not_truncated_when_under_cap():
+    recs = StructureSource().feed(
+        b"\x1b]133;C\x07hello\x1b]133;D;0\x07")
+    assert recs[0].stdout == "hello"
+    assert recs[0].truncated is False
+
+
+def test_partial_stdout_truncated_flag_set_mid_command():
+    src = StructureSource()
+    src.feed(b"\x1b]133;C\x07")
+    chunk = b"y" * 65536
+    for _ in range((_MAX_STDOUT // len(chunk)) * 3):
+        src.feed(chunk)
+    assert src.stdout_truncated is True
+    assert len(src.partial_stdout()) < _MAX_STDOUT * 2
