@@ -42,7 +42,7 @@ read — instead of guessed from output timing:
 | `idle` | nothing is running | call `run_command` for the next thing |
 | `running` | a command is executing | poll `read_output` |
 | `awaiting-input` | a REPL/prompt is blocked on stdin | drive it with `send_keys` |
-| `password` | a secret prompt (`sudo`, `read -s`) is waiting, echo off | **stop** — only send input here with the human's explicit consent |
+| `password` | a secret prompt (`sudo`, `read -s`) is waiting, echo off | **stop** — `send_keys` raises unless you pass `confirm_password_prompt=True`, which you should only do with the human's explicit consent |
 | `tui` | a full-screen program (vim, top, less) owns the terminal | use `read_screen`/`send_keys`, not `run_command` |
 
 ## Install

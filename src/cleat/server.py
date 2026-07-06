@@ -89,7 +89,8 @@ def run_command(command: str, timeout: float = 10.0) -> dict:
 
 
 @mcp.tool()
-def send_keys(keys: str, enter: bool = False, timeout: float = 2.0) -> dict:
+def send_keys(keys: str, enter: bool = False, timeout: float = 2.0,
+              confirm_password_prompt: bool = False) -> dict:
     """Send input to a running interactive program (a REPL, a prompt, a TUI)
     started by run_command, then return the rendered screen.
 
@@ -97,11 +98,15 @@ def send_keys(keys: str, enter: bool = False, timeout: float = 2.0) -> dict:
     "\\u001b"=Esc. Set enter=True to append a newline. Returns {screen, cursor,
     exit_code, completed, state}; the screen is rendered by a virtual terminal
     so REPL/TUI output is clean (no per-keystroke redraw noise). completed=True
-    (with an exit_code) means the program exited. If the state you're driving
-    is "password" (see module docstring), only send input here with the human's
-    explicit consent - don't relay a secret on your own initiative.
+    (with an exit_code) means the program exited.
+
+    If the state you're driving is "password" (see module docstring), this
+    call raises an error unless confirm_password_prompt=True is passed - only
+    set that with the human's explicit consent for what's being sent; don't
+    relay a secret on your own initiative.
     """
-    return _get_engine().send_keys(keys, enter=enter, timeout=timeout)
+    return _get_engine().send_keys(keys, enter=enter, timeout=timeout,
+                                    confirm_password_prompt=confirm_password_prompt)
 
 
 @mcp.tool()
