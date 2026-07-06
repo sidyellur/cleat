@@ -93,7 +93,7 @@ cleat            # runs the MCP server over stdio
 
 | Tool | Returns | Use for |
 |------|---------|---------|
-| `run_command(command, timeout)` | `{stdout, exit_code, completed, state}` (+ `files_changed` if watching, `spoofed_marks` if tampered) | normal commands — full, exact stdout |
+| `run_command(command, timeout, exact)` | `{stdout, exit_code, completed, state}` (+ `files_changed` if watching, `spoofed_marks` if tampered, `stdout_exact` if `exact=True`) | normal commands — full stdout, cleaned for readability |
 | `read_output(timeout)` | `{output, exit_code, completed, state}` | watching a long-running / streaming command |
 | `wait_for(timeout)` | `{output, exit_code, completed, state}` | blocking until the session needs attention — replaces a `read_output` polling loop |
 | `read_screen()` | `{screen, cursor, state}` | inspecting a full-screen TUI (vim, top, less) |
@@ -141,6 +141,11 @@ when a program it ran tried to lie about how it finished.
   commands.
 - **`files_changed` detects writes, not reads** (create/modify/delete under the
   watched root). Read-tracking needs privileged syscall tracing.
+- **`stdout` is cleaned, not byte-exact:** it's ANSI-stripped and trimmed
+  (a leaked leading newline, trailing whitespace) for readability, so leading
+  blank lines or trailing whitespace the command itself printed are dropped.
+  Pass `exact=True` to `run_command` for `stdout_exact` — ANSI-stripped only,
+  preserving the command's real output exactly.
 - **bash:** a command whose *first token* is a subshell `(...)` or brace group
   `{ ...; }` emits no start mark; its exit code is recovered but stdout for that
   one command is not captured.
