@@ -118,6 +118,8 @@ class Engine:
         self._inject_dir = None
         self._shell_pid = None  # set in start(); the state probe's "fg" baseline
         self._altscreen = False  # tracked in _read_loop; drives state=="tui"
+        self._altscreen_pgid = None  # fg pgid when altscreen was entered; used
+                                      # to detect a stale flag (issue #17)
         # Constructed in start() once we know the injection nonce (or lack
         # thereof); a pre-start placeholder so attribute access never 500s.
         self._struct = StructureSource()
@@ -195,7 +197,18 @@ class Engine:
                 # Track alt-screen entry/exit for the state probe (state=="tui").
                 altscreen_matches = _ALTSCREEN_RE.findall(data)
                 if altscreen_matches:
-                    self._altscreen = altscreen_matches[-1] == b"h"
+                    entering = altscreen_matches[-1] == b"h"
+                    self._altscreen = entering
+                    if entering:
+                        # Record which fg pgid entered altscreen, so a stale
+                        # flag (the program died without emitting rmcup) can
+                        # be detected later by _probe_state (issue #17).
+                        try:
+                            self._altscreen_pgid = os.tcgetpgrp(self._proc.fd)
+                        except OSError:
+                            self._altscreen_pgid = None
+                    else:
+                        self._altscreen_pgid = None
                 # Gated on struct/altscreen state AS OF THIS CHUNK (issue #16) -
                 # must run after the updates above, not before.
                 self._answer_terminal_queries(data)
@@ -329,7 +342,13 @@ class Engine:
                                raw mode AT THE PROMPT, so checking termios
                                before this would misread a prompt as
                                awaiting-input.
-          2. tui             - alt-screen active (vim/top/less).
+          2. tui             - alt-screen active (vim/top/less) AND the fg
+                               pgid still matches whichever process entered
+                               it. A TUI killed without emitting its rmcup
+                               exit sequence (SIGKILL, crash) leaves the flag
+                               set; once something ELSE owns the foreground,
+                               it's stale and cleared instead of trusted
+                               (issue #17).
           3. password        - ECHO off, ICANON on (sudo, read -s, getpass).
           4. awaiting-input  - ICANON off: a readline/libedit line editor is
                                provably blocked on input.
@@ -357,7 +376,14 @@ class Engine:
             if fg == self._shell_pid and self._struct.idle:
                 return "idle"
             if self._altscreen:
-                return "tui"
+                if self._altscreen_pgid is None or fg == self._altscreen_pgid:
+                    return "tui"
+                # fg has moved to a different process group than the one
+                # that entered altscreen: that program is gone (died without
+                # rmcup) and whatever's foreground now isn't a TUI we saw
+                # enter altscreen. Don't trust the stale flag.
+                self._altscreen = False
+                self._altscreen_pgid = None
             lflag = termios.tcgetattr(self._proc.fd)[3]
             echo = bool(lflag & termios.ECHO)
             icanon = bool(lflag & termios.ICANON)
