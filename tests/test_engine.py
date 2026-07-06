@@ -264,7 +264,39 @@ def test_state_password_on_read_dash_s(bash_eng):
     r = bash_eng.run_command("read -s x", timeout=2)
     assert not r["completed"]
     assert r["state"] == "password"
-    bash_eng.send_keys("secret", enter=True)  # drain so teardown is clean
+    bash_eng.send_keys("secret", enter=True,
+                        confirm_password_prompt=True)  # drain so teardown is clean
+
+
+# -- password prompt enforcement (issue #24) --------------------------------
+def test_send_keys_raises_at_password_prompt_without_confirm(bash_eng):
+    # The README/docstrings market "password" state as "stop - only send
+    # input here with the human's explicit consent," but nothing enforced
+    # it: send_keys had no state check at all. Sending input to a password
+    # prompt now requires a deliberate per-call opt-in.
+    r = bash_eng.run_command("read -s x", timeout=2)
+    assert not r["completed"] and r["state"] == "password"
+    with pytest.raises(RuntimeError, match="password"):
+        bash_eng.send_keys("secret", enter=True)
+    bash_eng.send_keys("secret", enter=True,
+                        confirm_password_prompt=True)  # drain so teardown is clean
+
+
+def test_send_keys_allowed_at_password_prompt_with_confirm(bash_eng):
+    r = bash_eng.run_command("read -s x", timeout=2)
+    assert not r["completed"] and r["state"] == "password"
+    r = bash_eng.send_keys("secret", enter=True, confirm_password_prompt=True)
+    assert r["completed"]
+
+
+def test_send_keys_confirm_flag_irrelevant_outside_password_state(bash_eng):
+    # The flag only matters at a password prompt - passing it (or not) at
+    # any other state must have no effect.
+    r = bash_eng.run_command("python3", timeout=5)
+    assert not r["completed"] and r["state"] == "awaiting-input"
+    r = bash_eng.send_keys("print(6*7)", enter=True)
+    assert "42" in r["screen"]
+    bash_eng.send_keys("exit()", enter=True)
 
 
 def test_state_tui_then_idle_after_quit(bash_eng):

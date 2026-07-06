@@ -543,7 +543,8 @@ class Engine:
             return self._augment({"screen": screen, "cursor": cursor})
 
     @_serialized
-    def send_keys(self, keys, enter=False, timeout=2.0, idle=0.4) -> dict:
+    def send_keys(self, keys, enter=False, timeout=2.0, idle=0.4,
+                  confirm_password_prompt=False) -> dict:
         """Send raw input to the running program, then return the rendered screen.
 
         Control chars go through as-is: "\\u0003"=Ctrl-C, "\\u0004"=Ctrl-D.
@@ -551,9 +552,22 @@ class Engine:
         completed, state}; the screen is pyte-rendered so REPL/TUI output is
         clean (no per-keystroke redraw noise). completed=True (with exit_code)
         if the program exited.
+
+        Raises RuntimeError if state=="password" and confirm_password_prompt
+        is not True (issue #24): a secret prompt is waiting on stdin with
+        echo off, and this makes relaying anything there a deliberate,
+        per-call opt-in instead of the default path - only pass True with
+        the human's explicit consent for what's being sent.
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
+        with self._cond:
+            if self._probe_state() == "password" and not confirm_password_prompt:
+                raise RuntimeError(
+                    "session is at a password prompt - pass "
+                    "confirm_password_prompt=True to send input here, only "
+                    "with the human's explicit consent for what's being sent"
+                )
         payload = keys + ("\n" if enter else "")
         with self._cond:
             start_rc = self._rec_total()
