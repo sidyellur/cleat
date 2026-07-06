@@ -36,8 +36,15 @@ import tempfile
 
 OSC133_ZSHRC = r'''# --- headless terminal layer: injected zsh rcfile ---
 ZDOTDIR="${_HEADLESS_REAL_ZDOTDIR:-$HOME}"
-[ -f "$ZDOTDIR/.zshenv" ] && source "$ZDOTDIR/.zshenv"
-[ -f "$ZDOTDIR/.zshrc" ]  && source "$ZDOTDIR/.zshrc"
+[ -f "$ZDOTDIR/.zshenv" ]   && source "$ZDOTDIR/.zshenv"
+# .zprofile/.zlogin: only a LOGIN shell sources these normally, but a real
+# terminal (Terminal.app/iTerm2 on macOS) spawns login shells by default -
+# PATH/env set only there (e.g. Homebrew's `brew shellenv` in .zprofile)
+# would otherwise be silently absent here (issue #29). Order matches a real
+# login shell: .zshenv -> .zprofile -> .zshrc -> .zlogin.
+[ -f "$ZDOTDIR/.zprofile" ] && source "$ZDOTDIR/.zprofile"
+[ -f "$ZDOTDIR/.zshrc" ]    && source "$ZDOTDIR/.zshrc"
+[ -f "$ZDOTDIR/.zlogin" ]   && source "$ZDOTDIR/.zlogin"
 
 autoload -Uz add-zsh-hook
 _h133_preexec() { printf '\033]133;C;k=@NONCE@\007' }
@@ -58,6 +65,18 @@ PROMPT_EOL_MARK=''
 # once per interactive command and - unlike a hand-rolled DEBUG-trap armed flag -
 # is not fooled by a PS1 that runs command substitution (the bash 4.x/5.x bug).
 OSC133_BASHRC = r'''# --- headless terminal layer: injected bash rcfile (bash-preexec) ---
+# A real terminal (Terminal.app/iTerm2 on macOS) spawns login shells by
+# default; --rcfile only applies to non-login interactive shells, so PATH/env
+# set only in a login shell's profile file was otherwise silently absent
+# here (issue #29). Mirror bash's own login-shell precedence: .bash_profile,
+# else .bash_login, else .profile - the first one found, not all three.
+if [ -f "$HOME/.bash_profile" ]; then
+  source "$HOME/.bash_profile"
+elif [ -f "$HOME/.bash_login" ]; then
+  source "$HOME/.bash_login"
+elif [ -f "$HOME/.profile" ]; then
+  source "$HOME/.profile"
+fi
 [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc"
 
 # Source vendored bash-preexec LAST (it preserves any PROMPT_COMMAND ~/.bashrc set).

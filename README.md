@@ -114,7 +114,11 @@ agent ─(MCP)─ server.py ─ engine.py (persistent PTY, ptyprocess)
 The engine injects OSC 133 per shell without touching your real config: zsh via
 a temp `$ZDOTDIR`, bash via `--rcfile` + vendored [bash-preexec](https://github.com/rcaloras/bash-preexec),
 and fish via `fish -C 'source ...'` (fish ≥4 also emits its own native marks
-alongside ours; see below for why that’s harmless).
+alongside ours; see below for why that’s harmless). Despite spawning a
+non-login shell, both also source the login/profile files a real terminal's
+login shell would (`.zprofile`/`.zlogin` for zsh, `.bash_profile`/
+`.bash_login`/`.profile` for bash) — so PATH/env set only there (e.g.
+Homebrew's `brew shellenv` in `.zprofile`) isn't silently missing.
 
 ### Nonce-authenticated marks
 
