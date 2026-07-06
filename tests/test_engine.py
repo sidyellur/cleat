@@ -345,6 +345,27 @@ def test_ctrl_c_interrupts(bash_eng):
     assert r["completed"] and r["exit_code"] is not None
 
 
+def test_pyte_feed_does_not_backpressure_pty_draining(bash_eng, monkeypatch):
+    # Issue #23: pyte.feed() ran synchronously on the reader thread for every
+    # chunk, so a pathologically slow render (pyte is pure-Python) delayed
+    # draining the PTY for the WHOLE session, not just screen-reading calls.
+    # Simulate that slowness and confirm a plain streaming command still
+    # completes promptly - proving the reader thread isn't waiting on it.
+    real_feed = bash_eng._pyte.feed
+
+    def slow_feed(data):
+        time.sleep(0.05)
+        return real_feed(data)
+
+    monkeypatch.setattr(bash_eng._pyte, "feed", slow_feed)
+
+    t0 = time.monotonic()
+    r = bash_eng.run_command("head -c 200000 /dev/zero | tr '\\0' x", timeout=10)
+    elapsed = time.monotonic() - t0
+    assert r["completed"]
+    assert elapsed < 1.0, f"run_command was backpressured by slow pyte feed: {elapsed}s"
+
+
 def test_memory_bounded(bash_eng):
     for _ in range(8):
         bash_eng.run_command("head -c 200000 /dev/zero | tr '\\0' x", timeout=8)
