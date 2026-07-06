@@ -67,6 +67,13 @@ _MAX_RECORDS = 256
 # beat until the next chunk arrives.
 _ALTSCREEN_RE = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
 
+# The exact filename inject.prepare() writes the injected rcfile as, per
+# shell - needed so start() can unlink it once the shell has read it (issue
+# #21: its PATH stays visible in argv/cmdline for the life of the process on
+# bash/fish, so any same-uid child spawned later could otherwise open() it
+# and read the nonce straight out).
+_INJECTED_RCFILE_NAME = {"zsh": ".zshrc", "bash": "bashrc", "fish": "marks.fish"}
+
 
 def _serialized(method):
     """Serialize agent-facing calls: one command/read drives the single shell at
@@ -115,20 +122,27 @@ class Engine:
         self._api_lock = threading.Lock()  # serializes agent-facing calls
         self._reader = None
         self._alive = False
+        self._first_output = threading.Event()  # set by _read_loop on its first
+                                                   # successful read (issue #21)
+        self._rcfile_to_unlink = None  # path to remove once the shell has read it
 
     # -- lifecycle ----------------------------------------------------------
     def start(self):
         base_env = os.environ.copy()
         nonce = None
+        shell_base = os.path.basename(self.shell)
         if self.inject:
             argv, env, self._inject_dir, nonce = prepare(self.shell, base_env)
+            rc_name = _INJECTED_RCFILE_NAME.get(shell_base)
+            if rc_name and self._inject_dir:
+                self._rcfile_to_unlink = os.path.join(self._inject_dir, rc_name)
         else:
             argv, env = [self.shell], base_env
         # fish >= 4 runs its own native, un-nonced OSC 133 emitter alongside
         # ours - expected, harmless telemetry, not tampering (see
         # structure.py's expect_unnonced_marks docs). Only fish is known to
         # do this; bash/zsh have no ambient native emitter of their own.
-        native_marks_shell = os.path.basename(self.shell) == "fish"
+        native_marks_shell = shell_base == "fish"
         self._struct = StructureSource(nonce=nonce,
                                         expect_unnonced_marks=native_marks_shell)
         # Always advertise xterm-256color, regardless of what TERM (if any)
@@ -148,9 +162,29 @@ class Engine:
         self._alive = True
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        if self._rcfile_to_unlink:
+            # Wait for the shell's first output: by then it has already
+            # fully read/sourced the injected rcfile during its own startup
+            # (before showing anything), so it's safe to remove the file
+            # from disk now - a same-uid child spawned later in the session
+            # can't read the nonce out of it even if it discovers the path
+            # via /proc/<pid>/cmdline (bash/fish carry it directly in argv;
+            # issue #21). Blocking start() on this (not just unlinking
+            # asynchronously from the reader thread) closes the race where a
+            # caller could otherwise call run_command() before the unlink
+            # happens. Bounded wait: an unusually slow/hung shell start
+            # shouldn't leave start() hanging forever - unlink anyway once
+            # the timeout elapses rather than leave the file exposed.
+            self._first_output.wait(timeout=5.0)
+            try:
+                os.unlink(self._rcfile_to_unlink)
+            except OSError:
+                pass
+            self._rcfile_to_unlink = None
         return self
 
     def _read_loop(self):
+        first = True
         while self._alive:
             try:
                 data = self._proc.read(4096)
@@ -158,6 +192,9 @@ class Engine:
                 break
             if not data:
                 break
+            if first:
+                first = False
+                self._first_output.set()
             self._answer_terminal_queries(data)
             with self._cond:
                 # Feed under the lock so struct state (commands_started), the
