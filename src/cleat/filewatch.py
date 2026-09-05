@@ -14,6 +14,21 @@ cheap, with no extra dependency.
 Cost control: ignores noisy/huge dirs (.git, node_modules, venvs, caches) and
 caps the file count; if capped, `truncated` is True and the diff is unreliable
 (point watch_files() at a specific project dir, not $HOME).
+
+Known cost (issue #28, not addressed here): run_command calls snapshot()
+twice per watched command (before/after), each a full synchronous os.walk -
+latency scales with file count under the watched root regardless of how
+much actually changed. The real fix is OS-level notification (inotify on
+Linux, FSEvents on macOS), which this project deliberately doesn't pull in
+as a dependency (see the module's "no extra dependency" framing above); a
+directory-mtime-based caching layer was also considered, but a directory's
+own mtime only changes on entry add/remove, not on an existing file's
+content changing in place - it would still need to stat every file under an
+unchanged directory to catch in-place edits, so the win is narrower than it
+first looks and wasn't worth the added statefulness (this module is
+currently a pure snapshot/diff pair with no cross-call cache to invalidate
+correctly if watch_files() switches roots between commands). Left as a
+follow-up if the latency actually bites in practice.
 """
 
 import os
@@ -27,7 +42,8 @@ MAX_FILES = 50_000
 
 
 def snapshot(root):
-    """Map path -> (mtime_ns, size) for files under root. Returns (snap, truncated)."""
+    """Map path -> (ino, mtime_ns, ctime_ns, size) for files under root.
+    Returns (snap, truncated)."""
     snap = {}
     truncated = False
     for dirpath, dirnames, filenames in os.walk(root):
@@ -38,7 +54,17 @@ def snapshot(root):
                 st = os.lstat(p)
             except OSError:
                 continue
-            snap[p] = (st.st_mtime_ns, st.st_size)
+            # (mtime_ns, size) alone missed an edit that preserves both -
+            # e.g. `cp -p`/`tar -x` restoring original timestamps, or a
+            # deliberate `touch -r original modified` after an edit (issue
+            # #28). st_ctime_ns changes on ANY metadata or content write,
+            # even when mtime is deliberately restored afterward - unlike
+            # mtime, userspace has no portable way to set ctime to an
+            # arbitrary value, so a forged-timestamp edit still shows up
+            # here. st_ino is cheap insurance against inode reuse at the
+            # same path being missed if mtime/ctime/size ever happened to
+            # coincide too - matches the issue's own suggested key exactly.
+            snap[p] = (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
             if len(snap) >= MAX_FILES:
                 return snap, True
     return snap, truncated
