@@ -246,7 +246,8 @@ def test_wait_for_settle_window_survives_stale_non_running_state(bash_eng, monke
     # failed on slower CI runners.
     fifo = tmp_path / "gate"
     os.mkfifo(fifo)
-    r = bash_eng.run_command(f"cat < {fifo}; echo woke", timeout=0.02)
+    # `read` is a builtin: no fork/exec between the release and the D mark.
+    r = bash_eng.run_command(f"read x < {fifo}; echo woke", timeout=0.02)
     assert not r["completed"]                      # still running for real
 
     # Wait for the C mark: only once the command is actually in flight is
@@ -272,20 +273,37 @@ def test_wait_for_settle_window_survives_stale_non_running_state(bash_eng, monke
     with bash_eng._cond:
         assert bash_eng._probe_state() == "awaiting-input"  # confirm the fake fools it
 
-    # Release the command a beat AFTER wait_for has started its settle
-    # window, so the real D mark arrives while the state is still (falsely)
-    # claiming "awaiting-input".
+    # Release the command the moment wait_for enters its settle window - the
+    # first _cond.wait() it makes, since the (faked) state skips its
+    # "running" loop entirely. The real D mark then lands while the probe
+    # is still falsely claiming "awaiting-input". Hooking the wait, rather
+    # than sleeping a fixed beat on a side thread, keeps this independent
+    # of machine speed: the settle window is a deliberate 0.2s bound and
+    # a fixed delay plus a forked `cat` blew through it on slow macOS CI
+    # runners. Now it only has to cover a builtin read, an echo, and the
+    # precmd hook.
+    real_wait = bash_eng._cond.wait
+    released = threading.Event()
+    releaser = []
+
     def _release():
-        time.sleep(0.05)
         with open(fifo, "w") as f:
             f.write("go\n")
 
-    t = threading.Thread(target=_release, daemon=True)
-    t.start()
+    def _wait_then_release(timeout=None):
+        if not released.is_set():
+            released.set()
+            t = threading.Thread(target=_release, daemon=True)
+            t.start()
+            releaser.append(t)
+        return real_wait(timeout)
+
+    monkeypatch.setattr(bash_eng._cond, "wait", _wait_then_release)
     # Despite the state claiming "awaiting-input" throughout, the settle
     # window must still wait for the REAL completion instead of trusting it.
     r2 = bash_eng.wait_for(timeout=2.0)
-    t.join(2.0)
+    assert released.is_set(), "wait_for never entered its settle wait"
+    releaser[0].join(2.0)
     assert r2["completed"] is True and r2["exit_code"] == 0
     assert "woke" in r2["output"]
 
