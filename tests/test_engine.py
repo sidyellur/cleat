@@ -491,6 +491,59 @@ def test_ctrl_c_interrupts(bash_eng):
     assert r["completed"] and r["exit_code"] is not None
 
 
+def test_query_responder_write_serialized_with_api_writes(bash_eng):
+    # Issue #25: _answer_terminal_queries writes to the PTY master from the
+    # reader thread; run_command/send_keys write to it from the API thread
+    # while holding _cond. If the reader thread's write happens OUTSIDE
+    # _cond, that lock doesn't actually serialize the two write paths - a
+    # concurrent attempt to acquire _cond from another thread would succeed
+    # even while the query-responder write is in flight. Prove mutual
+    # exclusion directly: make the query-responder's specific write pause
+    # until a second thread has tried (and, if truly serialized, failed) to
+    # grab _cond in the meantime.
+    write_started = threading.Event()
+    write_can_finish = threading.Event()
+    query_write_seen = threading.Event()
+    lock_was_held_during_write = threading.Event()
+    real_write = bash_eng._proc.write
+
+    def spy_write(data):
+        if data == b"\x1b[1;1R":
+            query_write_seen.set()
+            write_started.set()
+            write_can_finish.wait(timeout=5.0)
+        return real_write(data)
+
+    bash_eng._proc.write = spy_write
+
+    def watcher():
+        if not write_started.wait(timeout=5.0):
+            write_can_finish.set()
+            return
+        acquired = bash_eng._cond.acquire(blocking=False)
+        if acquired:
+            bash_eng._cond.release()
+        else:
+            lock_was_held_during_write.set()
+        write_can_finish.set()
+
+    t = threading.Thread(target=watcher)
+    t.start()
+    # The responder is gated (issue #16): query-looking bytes inside a
+    # command's own output (between our C and D marks) are never answered.
+    # Pretend a full-screen program owns the terminal so this one query IS
+    # answered - what's under test here is the locking around the write,
+    # not the gate (covered separately below).
+    bash_eng._altscreen = True
+    bash_eng._altscreen_pgid = None
+    bash_eng.run_command(r"printf '\033[6n'", timeout=5)
+    t.join(timeout=5)
+
+    assert query_write_seen.is_set(), "query-responder write never triggered"
+    assert lock_was_held_during_write.is_set(), \
+        "query-responder's PTY write was not serialized under _cond"
+
+
 def test_terminal_query_bytes_in_command_output_not_answered(bash_eng):
     # Issue #16: a command's OWN stdout containing what looks like a terminal
     # query byte sequence must NOT be treated as a genuine query and trigger

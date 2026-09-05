@@ -220,7 +220,11 @@ class Engine:
                     else:
                         self._altscreen_pgid = None
                 # Gated on struct/altscreen state AS OF THIS CHUNK (issue #16) -
-                # must run after the updates above, not before.
+                # must run after the updates above, not before. And it must
+                # run INSIDE _cond (issue #25): it writes to the same PTY
+                # master run_command/send_keys write to under this lock, so
+                # the two write paths are actually serialized instead of
+                # merely relying on os.write() being atomic at the kernel level.
                 self._answer_terminal_queries(data, was_idle)
                 try:
                     self._pyte.feed(data)
