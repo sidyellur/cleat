@@ -1,6 +1,6 @@
 """Unit tests for the OSC 133 parser - pure, fast, no PTY."""
 
-from cleat.structure import StructureSource, _clean
+from cleat.structure import StructureSource, _clean, _clean_exact, _MAX_STDOUT
 
 
 def _pairs(recs):
@@ -77,6 +77,28 @@ def test_charset_designation_stripped_from_stdout():
 def test_clean_normalizes_newlines_and_trims():
     assert _clean(b"\x1b[Khi\r\nthere\r\n") == "hi\nthere"
     assert _clean(b"\nleading-nl-stripped") == "leading-nl-stripped"
+
+
+# -- byte-exact stdout (issue #22) ------------------------------------------
+# _clean() intentionally trims for readability - the sticky-note text. That's
+# not byte-exact, despite older docs claiming "full, exact stdout". _clean_exact
+# is the actual byte-exact (module ANSI/OSC stripping, which was never in
+# dispute) counterpart: normalizes \r\n/\r but does NOT trim leading/trailing
+# whitespace or newlines.
+def test_clean_exact_preserves_leading_and_trailing_whitespace():
+    assert _clean_exact(b"\n\n\na\n\n\n") == "\n\n\na\n\n\n"
+    assert _clean_exact(b"  x  ") == "  x  "
+
+
+def test_clean_exact_still_normalizes_crlf_and_strips_ansi():
+    assert _clean_exact(b"\x1b[31mred\x1b[0m\r\nline2\r\n") == "red\nline2\n"
+
+
+def test_record_carries_stdout_exact_alongside_cleaned():
+    recs = StructureSource().feed(
+        b"\x1b]133;C\x07  padded  \n\n\x1b]133;D;0\x07")
+    assert recs[0].stdout == "  padded"              # cleaned (existing behavior)
+    assert recs[0].stdout_exact == "  padded  \n\n"    # byte-exact
 
 
 # -- nonce-authenticated marks ----------------------------------------------
@@ -176,3 +198,38 @@ def test_expect_unnonced_marks_false_by_default():
     recs = src.feed(b"\x1b]133;C\x07x\x1b]133;D;0\x07")
     assert recs == []
     assert src.spoofed_marks == 2
+
+
+# -- unbounded stdout accumulator (issue #15) --------------------------------
+
+def test_stdout_capped_during_single_command():
+    # A single command's stdout must not grow without bound while RUNNING -
+    # feeding it well past _MAX_STDOUT must keep the accumulator bounded, not
+    # balloon to the full size of whatever the command printed.
+    src = StructureSource()
+    src.feed(b"\x1b]133;C\x07")
+    chunk = b"x" * 65536
+    for _ in range((_MAX_STDOUT // len(chunk)) * 3):
+        src.feed(chunk)
+        assert len(src._stdout) <= 2 * _MAX_STDOUT
+    recs = src.feed(b"\x1b]133;D;0\x07")
+    assert len(recs) == 1
+    assert recs[0].truncated is True
+    assert len(recs[0].stdout) < 3 * len(chunk) * (_MAX_STDOUT // len(chunk))
+
+
+def test_stdout_not_truncated_when_under_cap():
+    recs = StructureSource().feed(
+        b"\x1b]133;C\x07hello\x1b]133;D;0\x07")
+    assert recs[0].stdout == "hello"
+    assert recs[0].truncated is False
+
+
+def test_partial_stdout_truncated_flag_set_mid_command():
+    src = StructureSource()
+    src.feed(b"\x1b]133;C\x07")
+    chunk = b"y" * 65536
+    for _ in range((_MAX_STDOUT // len(chunk)) * 3):
+        src.feed(chunk)
+    assert src.stdout_truncated is True
+    assert len(src.partial_stdout()) < _MAX_STDOUT * 2

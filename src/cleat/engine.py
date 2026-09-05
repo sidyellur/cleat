@@ -38,6 +38,11 @@ read), not guessed from output timing. See _probe_state() for the derivation
 and PLAN.md for the full rationale. "spoofed_marks" appears alongside it,
 but only when a program running in the session has tried to forge an OSC 133
 mark (see structure.py's nonce filtering).
+
+A 6th value, "possibly-awaiting-input", can also appear: a best-effort,
+Linux-only refinement (issue #27) for the one termios-level ambiguity the
+model above admits it can't resolve - a plain `read x`/`cat` waiting on
+stdin looks identical to a busy program by termios alone.
 """
 
 import os
@@ -67,6 +72,29 @@ _MAX_RECORDS = 256
 # beat until the next chunk arrives.
 _ALTSCREEN_RE = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
 
+# Kernel wait-channel names (issue #27) a process blocked reading from a tty
+# or pipe shows up under in /proc/<pid>/wchan on Linux - as opposed to, say,
+# a `sleep` (hrtimer_nanosleep) or a CPU-bound loop ("0"/no meaningful wchan).
+# This is best-effort: it needs kernel symbol info (CONFIG_KALLSYMS) to be
+# populated at all, isn't available on macOS, and only reflects the exact pid
+# checked (the first process in a multi-stage pipeline's process group, same
+# simplification the rest of the state probe already makes for "fg"). A miss
+# here just falls through to the existing "running" bucket - never a
+# regression, only a refinement of it.
+_WCHAN_BLOCKED_ON_READ = {"wait_woken", "tty_read", "n_tty_read", "read_chan",
+                           "pipe_read", "pipe_wait"}
+
+
+def _blocked_on_read(pgid):
+    """Best-effort Linux-only check: does the foreground process look like
+    it's blocked in a read-like wait? Returns False on ANY failure (non-
+    Linux, no /proc, permission, no kernel symbols) - see module comment."""
+    try:
+        with open(f"/proc/{pgid}/wchan") as f:
+            return f.read().strip() in _WCHAN_BLOCKED_ON_READ
+    except OSError:
+        return False
+
 
 def _serialized(method):
     """Serialize agent-facing calls: one command/read drives the single shell at
@@ -90,6 +118,8 @@ class Engine:
         self._inject_dir = None
         self._shell_pid = None  # set in start(); the state probe's "fg" baseline
         self._altscreen = False  # tracked in _read_loop; drives state=="tui"
+        self._altscreen_pgid = None  # fg pgid when altscreen was entered; used
+                                      # to detect a stale flag (issue #17)
         # Constructed in start() once we know the injection nonce (or lack
         # thereof); a pre-start placeholder so attribute access never 500s.
         self._struct = StructureSource()
@@ -158,7 +188,6 @@ class Engine:
                 break
             if not data:
                 break
-            self._answer_terminal_queries(data)
             with self._cond:
                 # Feed under the lock so struct state (commands_started), the
                 # raw buffer, and the screen advance atomically for readers.
@@ -168,17 +197,40 @@ class Engine:
                 # Track alt-screen entry/exit for the state probe (state=="tui").
                 altscreen_matches = _ALTSCREEN_RE.findall(data)
                 if altscreen_matches:
-                    self._altscreen = altscreen_matches[-1] == b"h"
+                    entering = altscreen_matches[-1] == b"h"
+                    self._altscreen = entering
+                    if entering:
+                        # Record which fg pgid entered altscreen, so a stale
+                        # flag (the program died without emitting rmcup) can
+                        # be detected later by _probe_state (issue #17).
+                        try:
+                            self._altscreen_pgid = os.tcgetpgrp(self._proc.fd)
+                        except OSError:
+                            self._altscreen_pgid = None
+                    else:
+                        self._altscreen_pgid = None
+                # Gated on struct/altscreen state AS OF THIS CHUNK (issue #16) -
+                # must run after the updates above, not before.
+                self._answer_terminal_queries(data)
                 try:
                     self._pyte.feed(data)
                 except Exception:
                     pass  # never let a rendering hiccup kill the read loop
-                # Bound memory: drop the consumed raw prefix + evict old records.
+                # Bound memory: keep only the most recent _MAX_RAW bytes,
+                # regardless of whether a cursor has consumed them yet
+                # (issue #15) - during a single long/large-output command
+                # nobody drains via _cursor until it completes, so gating the
+                # drop on "consumed" bytes let this grow unbounded for the
+                # whole command. A cursor that pointed into now-dropped bytes
+                # is clamped forward to _base; that consumer simply missed
+                # some of the bounded-out middle, same tradeoff as _records
+                # eviction below.
                 if len(self._raw) > _MAX_RAW:
-                    drop = self._cursor - self._base
-                    if drop > 0:
-                        del self._raw[:drop]
-                        self._base += drop
+                    drop = len(self._raw) - _MAX_RAW
+                    del self._raw[:drop]
+                    self._base += drop
+                    if self._cursor < self._base:
+                        self._cursor = self._base
                 if len(self._records) > _MAX_RECORDS:
                     drop = len(self._records) - _MAX_RECORDS
                     del self._records[:drop]
@@ -234,7 +286,28 @@ class Engine:
         Some shells/TUIs (notably fish 4.x) refuse to draw a prompt until the
         terminal answers DA1 / cursor-position / background-color queries. Under
         a bare PTY nobody answers, so they hang forever. We send minimal canned
-        replies. Harmless for shells that never ask (zsh/bash)."""
+        replies.
+
+        Gated (issue #16): a command's OWN stdout can contain these same byte
+        sequences - a `cat` on a binary/log file, a program that deliberately
+        prints them - and blindly pattern-matching raw output let that
+        command's own output forge input into the shell's stdin (a fake
+        cursor-position reply lands as if the human had typed it). We can't
+        attribute a byte sequence to "a real terminal query" vs. "a command's
+        output" at the byte level, so instead we only answer while a real
+        query is plausible: before the shell's very first prompt (fish's own
+        startup probing - the reason this responder exists) or while a
+        full-screen program legitimately owns the terminal (altscreen). Once
+        the shell has shown a prompt and isn't in altscreen, we no longer
+        answer - a TUI that queries before ever entering altscreen won't get
+        an answer either, but no case in the test suite needs that, and it's
+        the safer tradeoff.
+
+        Caller holds _cond and has already fed `data` into self._struct and
+        updated self._altscreen for this chunk, so both reflect state
+        INCLUDING this read, not a chunk behind."""
+        if self._struct.prompts_seen > 0 and not self._altscreen:
+            return
         try:
             if b"\x1b[c" in data or b"\x1b[0c" in data:
                 self._proc.write(b"\x1b[?62;c")                      # DA1
@@ -276,14 +349,31 @@ class Engine:
                                raw mode AT THE PROMPT, so checking termios
                                before this would misread a prompt as
                                awaiting-input.
-          2. tui             - alt-screen active (vim/top/less).
+          2. tui             - alt-screen active (vim/top/less) AND the fg
+                               pgid still matches whichever process entered
+                               it. A TUI killed without emitting its rmcup
+                               exit sequence (SIGKILL, crash) leaves the flag
+                               set; once something ELSE owns the foreground,
+                               it's stale and cleared instead of trusted
+                               (issue #17).
           3. password        - ECHO off, ICANON on (sudo, read -s, getpass).
           4. awaiting-input  - ICANON off: a readline/libedit line editor is
                                provably blocked on input.
-          5. running         - a child owns the terminal and none of the
+          5. possibly-awaiting-input - canonical mode (ICANON on, echo on),
+                               but the foreground process looks blocked in a
+                               read-like wait per /proc/<pid>/wchan
+                               (best-effort, Linux only - see
+                               _blocked_on_read). A plain `read x` or `cat`
+                               waiting on stdin leaves termios looking
+                               identical to a busy program, so this is a
+                               refinement on top of termios facts, not a
+                               replacement for them.
+          6. running         - a child owns the terminal and none of the
                                above matched. Honest residue: canonical-mode
                                `cat` waiting on stdin is indistinguishable
-                               from a busy program by termios alone.
+                               from a busy program by termios alone, and the
+                               wchan check above is best-effort (may not be
+                               available at all, e.g. on macOS).
 
         Never raises: if tcgetpgrp/tcgetattr fail (OSError/termios.error -
         e.g. the fd closed under us), degrade to idle/running from marks
@@ -293,7 +383,14 @@ class Engine:
             if fg == self._shell_pid and self._struct.idle:
                 return "idle"
             if self._altscreen:
-                return "tui"
+                if self._altscreen_pgid is None or fg == self._altscreen_pgid:
+                    return "tui"
+                # fg has moved to a different process group than the one
+                # that entered altscreen: that program is gone (died without
+                # rmcup) and whatever's foreground now isn't a TUI we saw
+                # enter altscreen. Don't trust the stale flag.
+                self._altscreen = False
+                self._altscreen_pgid = None
             lflag = termios.tcgetattr(self._proc.fd)[3]
             echo = bool(lflag & termios.ECHO)
             icanon = bool(lflag & termios.ICANON)
@@ -301,6 +398,8 @@ class Engine:
                 return "password"
             if not icanon:
                 return "awaiting-input"
+            if _blocked_on_read(fg):
+                return "possibly-awaiting-input"
             return "running"
         except (OSError, termios.error):
             return "idle" if self._struct.idle else "running"
@@ -340,7 +439,7 @@ class Engine:
 
     # -- the agent-facing API ----------------------------------------------
     @_serialized
-    def run_command(self, cmd, timeout=10.0, idle=0.4) -> dict:
+    def run_command(self, cmd, timeout=10.0, idle=0.4, exact=False) -> dict:
         """Run a command. Returns {stdout, exit_code, completed, state}.
 
         completed=True  -> a D mark closed the command; exit_code is real.
@@ -348,12 +447,34 @@ class Engine:
                            for input or still running. stdout is what we have so
                            far; follow up with send_keys()/read_output().
         state -> see _probe_state(): "idle"|"running"|"awaiting-input"|
-                 "password"|"tui", derived from termios/fg-pgid, not guessed.
+                 "password"|"tui"|"possibly-awaiting-input", derived from
+                 termios/fg-pgid, not guessed.
         spoofed_marks -> present (and >0) only if a program in the session
                           tried to forge an OSC 133 mark; see structure.py.
+
+        Raises RuntimeError if the session isn't idle (issue #18): sending a
+        new command into an open REPL/TUI/prompt lands it INSIDE that
+        program instead of at the shell, which just times out confusingly.
+        Use send_keys() to drive whatever's open, or wait_for()/read_output()
+        until it's idle again, before calling run_command().
+
+        exact -> stdout is ANSI-stripped AND trimmed for readability (a
+                 leading newline some shells leak, trailing whitespace) - it
+                 is NOT byte-exact. Pass exact=True to also get
+                 stdout_exact: ANSI-stripped only, no trimming - the
+                 command's real output including leading/trailing whitespace
+                 and blank lines (issue #22).
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
+        with self._cond:
+            state = self._probe_state()
+            if state != "idle":
+                raise RuntimeError(
+                    f"session is in state {state!r}, not idle - use "
+                    "send_keys() to drive it, or wait_for()/read_output() "
+                    "until it's idle, before calling run_command() again"
+                )
         # Capture watch_root ONCE and reuse it for both snapshots (issue
         # #26): even with set_watch_root now @_serialized (so it can't
         # mutate self._watch_root mid-command), re-reading the attribute a
@@ -400,11 +521,19 @@ class Engine:
                 self._cursor = self._total()
                 result = {"stdout": rec.stdout, "exit_code": rec.exit_code,
                           "completed": True}
+                if rec.truncated:
+                    result["truncated"] = True
+                if exact:
+                    result["stdout_exact"] = rec.stdout_exact
             else:
                 # Not completed: hand back the clean post-C output if we have it.
                 self._cursor = self._total()
                 result = {"stdout": self._struct.partial_stdout(),
                           "exit_code": None, "completed": False}
+                if self._struct.stdout_truncated:
+                    result["truncated"] = True
+                if exact:
+                    result["stdout_exact"] = self._struct.partial_stdout_exact()
             result = self._augment(result)
 
         # files-touched: diff the watched tree once the command has finished.
@@ -506,7 +635,8 @@ class Engine:
             return self._augment({"screen": screen, "cursor": cursor})
 
     @_serialized
-    def send_keys(self, keys, enter=False, timeout=2.0, idle=0.4) -> dict:
+    def send_keys(self, keys, enter=False, timeout=2.0, idle=0.4,
+                  confirm_password_prompt=False) -> dict:
         """Send raw input to the running program, then return the rendered screen.
 
         Control chars go through as-is: "\\u0003"=Ctrl-C, "\\u0004"=Ctrl-D.
@@ -514,9 +644,22 @@ class Engine:
         completed, state}; the screen is pyte-rendered so REPL/TUI output is
         clean (no per-keystroke redraw noise). completed=True (with exit_code)
         if the program exited.
+
+        Raises RuntimeError if state=="password" and confirm_password_prompt
+        is not True (issue #24): a secret prompt is waiting on stdin with
+        echo off, and this makes relaying anything there a deliberate,
+        per-call opt-in instead of the default path - only pass True with
+        the human's explicit consent for what's being sent.
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
+        with self._cond:
+            if self._probe_state() == "password" and not confirm_password_prompt:
+                raise RuntimeError(
+                    "session is at a password prompt - pass "
+                    "confirm_password_prompt=True to send input here, only "
+                    "with the human's explicit consent for what's being sent"
+                )
         payload = keys + ("\n" if enter else "")
         with self._cond:
             start_rc = self._rec_total()
