@@ -1,10 +1,23 @@
 name: Release
 
-# Publish to PyPI when a version tag is pushed (e.g. v0.1.0).
-# Uses PyPI Trusted Publishing (OIDC) — no API tokens stored anywhere.
+# Publish to PyPI via Trusted Publishing (OIDC) — no API tokens stored anywhere.
+#
+# Two ways to release:
+#   1. Push a version tag (e.g. v0.2.2) — the original flow.
+#   2. Run this workflow manually (Actions → Release → Run workflow) with the
+#      version from pyproject.toml. It creates and pushes the tag itself, then
+#      publishes. Useful from environments that can push branches but not tags
+#      (e.g. Claude Code remote sessions). A tag pushed by the workflow's own
+#      token does not re-trigger the tag path, so nothing publishes twice.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release; must equal pyproject.toml's version (e.g. 0.2.2). Tag v<version> is created if missing."
+        required: true
+        type: string
 
 jobs:
   pypi-publish:
@@ -12,8 +25,31 @@ jobs:
     environment: pypi          # configure this name in the PyPI trusted publisher
     permissions:
       id-token: write          # required for OIDC trusted publishing
+      contents: write          # only used by the manual path, to push the tag
     steps:
       - uses: actions/checkout@v4
+
+      - name: Create version tag (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          declared=$(grep -E '^version = "' pyproject.toml | cut -d'"' -f2)
+          if [ "$declared" != "$VERSION" ]; then
+            echo "::error::pyproject.toml declares version $declared, but $VERSION was requested"
+            exit 1
+          fi
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; publishing from the checked-out ref."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "cleat $VERSION"
+          git push origin "refs/tags/$tag"
+          echo "Created and pushed $tag at $(git rev-parse HEAD)"
 
       - uses: actions/setup-python@v5
         with:
