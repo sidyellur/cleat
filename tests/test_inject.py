@@ -83,3 +83,78 @@ def test_bash_rcfile_references_vendored_preexec_by_absolute_path():
         assert os.path.isabs(content.split("if [ -r '")[1].split("'")[0])
     finally:
         _cleanup(cleanup_dir)
+
+
+# -- login/profile files not sourced (issue #29) -----------------------------
+# cleat spawns a non-login shell, unlike a real terminal (Terminal.app/iTerm2
+# spawn login shells by default on macOS) - PATH/env set only in a login
+# shell's profile files (a common pattern, e.g. Homebrew's `brew shellenv` in
+# .zprofile) was silently absent in cleat sessions.
+
+def test_zsh_rcfile_sources_profile_and_login_files():
+    argv, env, cleanup_dir, nonce = prepare("/bin/zsh", {"HOME": "/home/x"})
+    try:
+        content = open(os.path.join(cleanup_dir, ".zshrc")).read()
+        assert 'source "$ZDOTDIR/.zprofile"' in content
+        assert 'source "$ZDOTDIR/.zlogin"' in content
+        # Order matches what a real login shell sources:
+        # .zshenv -> .zprofile -> .zshrc -> .zlogin. Search for the actual
+        # `source` lines, not bare substrings - this module's own
+        # explanatory comment mentions all four names in prose too.
+        assert (content.index('source "$ZDOTDIR/.zshenv"')
+                < content.index('source "$ZDOTDIR/.zprofile"')
+                < content.index('source "$ZDOTDIR/.zshrc"')
+                < content.index('source "$ZDOTDIR/.zlogin"'))
+    finally:
+        _cleanup(cleanup_dir)
+
+
+def test_bash_rcfile_sources_a_profile_style_file_too():
+    argv, env, cleanup_dir, nonce = prepare("/bin/bash", {"HOME": "/home/x"})
+    try:
+        rc_path = argv[argv.index("--rcfile") + 1]
+        content = open(rc_path).read()
+        # bash's own login-shell precedence: .bash_profile, else
+        # .bash_login, else .profile (first one found, not all three).
+        assert ".bash_profile" in content
+        assert ".bash_login" in content
+        assert ".profile" in content
+        assert "$HOME/.bashrc" in content
+    finally:
+        _cleanup(cleanup_dir)
+
+
+# -- ambient shell-integration false positives (issue #20) -------------------
+# The injected rcfile re-sources the user's OWN .zshrc/.bashrc, which may
+# itself install ambient, un-nonced OSC-133-alike shell integration (iTerm2,
+# VS Code, Kitty, WezTerm) - those tools gate their self-install on terminal-
+# identity env vars, inherited here from whatever real terminal launched the
+# cleat/MCP-server process itself, even though this synthetic PTY session
+# isn't actually that terminal. Stripping those vars lets such integrations
+# correctly detect they're not running inside their real host and skip
+# self-installing, instead of firing marks cleat then has to (mis)classify.
+_AMBIENT_ENV = {
+    "TERM_PROGRAM": "iTerm.app",
+    "TERM_PROGRAM_VERSION": "3.5.0",
+    "ITERM_SESSION_ID": "w0t0p0:ABC",
+    "ITERM_PROFILE": "Default",
+    "VSCODE_INJECTION": "1",
+    "VSCODE_PID": "1234",
+    "KITTY_WINDOW_ID": "1",
+    "KITTY_PID": "5678",
+    "WEZTERM_EXECUTABLE": "/usr/bin/wezterm",
+    "WEZTERM_PANE": "0",
+}
+
+
+@pytest.mark.parametrize("shell", ["/bin/zsh", "/bin/bash", "/usr/bin/fish"])
+def test_ambient_terminal_identity_env_vars_stripped(shell):
+    base_env = {"HOME": "/home/x", "SOME_OTHER_VAR": "keep-me", **_AMBIENT_ENV}
+    argv, env, cleanup_dir, nonce = prepare(shell, base_env)
+    try:
+        for var in _AMBIENT_ENV:
+            assert var not in env, f"{var} should have been stripped"
+        assert env["SOME_OTHER_VAR"] == "keep-me"
+        assert env["HOME"] == "/home/x"
+    finally:
+        _cleanup(cleanup_dir)

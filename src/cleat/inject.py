@@ -36,8 +36,15 @@ import tempfile
 
 OSC133_ZSHRC = r'''# --- headless terminal layer: injected zsh rcfile ---
 ZDOTDIR="${_HEADLESS_REAL_ZDOTDIR:-$HOME}"
-[ -f "$ZDOTDIR/.zshenv" ] && source "$ZDOTDIR/.zshenv"
-[ -f "$ZDOTDIR/.zshrc" ]  && source "$ZDOTDIR/.zshrc"
+[ -f "$ZDOTDIR/.zshenv" ]   && source "$ZDOTDIR/.zshenv"
+# .zprofile/.zlogin: only a LOGIN shell sources these normally, but a real
+# terminal (Terminal.app/iTerm2 on macOS) spawns login shells by default -
+# PATH/env set only there (e.g. Homebrew's `brew shellenv` in .zprofile)
+# would otherwise be silently absent here (issue #29). Order matches a real
+# login shell: .zshenv -> .zprofile -> .zshrc -> .zlogin.
+[ -f "$ZDOTDIR/.zprofile" ] && source "$ZDOTDIR/.zprofile"
+[ -f "$ZDOTDIR/.zshrc" ]    && source "$ZDOTDIR/.zshrc"
+[ -f "$ZDOTDIR/.zlogin" ]   && source "$ZDOTDIR/.zlogin"
 
 autoload -Uz add-zsh-hook
 _h133_preexec() { printf '\033]133;C;k=@NONCE@\007' }
@@ -58,6 +65,18 @@ PROMPT_EOL_MARK=''
 # once per interactive command and - unlike a hand-rolled DEBUG-trap armed flag -
 # is not fooled by a PS1 that runs command substitution (the bash 4.x/5.x bug).
 OSC133_BASHRC = r'''# --- headless terminal layer: injected bash rcfile (bash-preexec) ---
+# A real terminal (Terminal.app/iTerm2 on macOS) spawns login shells by
+# default; --rcfile only applies to non-login interactive shells, so PATH/env
+# set only in a login shell's profile file was otherwise silently absent
+# here (issue #29). Mirror bash's own login-shell precedence: .bash_profile,
+# else .bash_login, else .profile - the first one found, not all three.
+if [ -f "$HOME/.bash_profile" ]; then
+  source "$HOME/.bash_profile"
+elif [ -f "$HOME/.bash_login" ]; then
+  source "$HOME/.bash_login"
+elif [ -f "$HOME/.profile" ]; then
+  source "$HOME/.profile"
+fi
 [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc"
 
 # Source vendored bash-preexec LAST (it preserves any PROMPT_COMMAND ~/.bashrc set).
@@ -93,6 +112,26 @@ end
 '''
 
 
+# Terminal-identity env vars that ambient third-party shell integration
+# (iTerm2, VS Code, Kitty, WezTerm) gates its own self-install on - they emit
+# their OWN un-nonced OSC 133 marks when they think they're running inside
+# their real host terminal. Since these vars are inherited from whatever
+# process spawned the cleat/MCP-server process itself (its own outer
+# terminal, if any), and the injected rcfile re-sources the user's REAL
+# .zshrc/.bashrc, those integrations happily self-install here too even
+# though this synthetic PTY session isn't actually their host terminal -
+# causing legitimate ambient marks to be misread as forged ones and
+# incrementing spoofed_marks on essentially every command (issue #20).
+# Stripping these before spawning gives them an accurate signal instead.
+_AMBIENT_INTEGRATION_ENV_VARS = (
+    "TERM_PROGRAM", "TERM_PROGRAM_VERSION",   # generic; also gates VS Code/iTerm2
+    "ITERM_SESSION_ID", "ITERM_PROFILE",       # iTerm2
+    "VSCODE_INJECTION", "VSCODE_PID",          # VS Code
+    "KITTY_WINDOW_ID", "KITTY_PID",            # Kitty
+    "WEZTERM_EXECUTABLE", "WEZTERM_PANE",      # WezTerm
+)
+
+
 def _write(dirpath, name, content):
     path = os.path.join(dirpath, name)
     with open(path, "w") as f:
@@ -106,6 +145,12 @@ def prepare(shell, base_env):
     call, or None for an unknown shell (nothing was injected)."""
     base = os.path.basename(shell)
     env = dict(base_env)
+    if base in ("zsh", "bash", "fish"):
+        # Only the shells whose rcfile we actually re-source the user's own
+        # config in (and only when we're doing nonce authentication at all) -
+        # see _AMBIENT_INTEGRATION_ENV_VARS above.
+        for var in _AMBIENT_INTEGRATION_ENV_VARS:
+            env.pop(var, None)
 
     if base == "zsh":
         nonce = secrets.token_hex(8)

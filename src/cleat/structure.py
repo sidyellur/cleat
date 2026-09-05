@@ -39,6 +39,24 @@ un-nonced OSC 133 emitter alongside ours (fish >= 4), and that's expected
 telemetry, not tampering, so it shouldn't trip a tamper counter. A mark with a
 *wrong* `k=` value is always counted regardless - only a deliberate attempt to
 impersonate our scheme would bother including one.
+
+Known false-positive source (issue #20): the injected rcfile re-sources the
+user's OWN .zshrc/.bashrc, which may itself install ambient, un-nonced OSC
+133-alike shell integration (iTerm2/VS Code/Kitty/WezTerm) if it thinks it's
+running inside its real host terminal - inject.py strips the common
+terminal-identity env vars those tools gate on (TERM_PROGRAM,
+ITERM_SESSION_ID, VSCODE_*, KITTY_*, WEZTERM_*) before spawning, which
+covers integrations that check those vars. There is deliberately NO
+position/content-based heuristic here (e.g. "only count marks that appear
+mid-command") - such a mark can legitimately land in exactly the same spot a
+real forgery would (an ambient integration's own precmd/preexec hook can
+fire before or after cleat's, depending on registration order, so its
+un-nonced marks can appear anywhere relative to cleat's own C/D), so trying
+to classify by position would either still flag legitimate ambient marks or
+blind spoofed_marks to the exact forged-mark pattern this file's own tests
+guard against. An integration that installs unconditionally regardless of
+env vars can still produce a false positive; that residual gap is a known,
+accepted limitation rather than something closeable at this layer.
 """
 
 import re
@@ -65,11 +83,25 @@ _ANSI_RE = re.compile(
 )
 
 
+# Cap a single in-flight command's stdout accumulator (issue #15): without
+# this, a command like `yes | head -c 2000000000` grows self._stdout without
+# bound for the ENTIRE duration of the command, since nothing drains it until
+# the D mark closes the record. Past the cap, keep a head window (context from
+# the start of the output) and a rolling tail window (the most recent bytes),
+# dropping the middle - callers are told via `truncated`.
+_MAX_STDOUT = 1 << 20  # 1 MiB
+_STDOUT_HEAD = _MAX_STDOUT // 2
+_STDOUT_TAIL = _MAX_STDOUT // 2
+
+
 @dataclass
 class CommandRecord:
     """One command's worth of facts, dug out of the byte soup."""
     stdout: str
     exit_code: Optional[int]
+    truncated: bool = False
+    stdout_exact: str = ""  # byte-exact (modulo ANSI-strip) counterpart to
+                             # `stdout` - see _clean_exact() (issue #22)
 
     def as_dict(self):
         return asdict(self)
@@ -79,19 +111,38 @@ class CommandRecord:
 
 
 def _clean(raw: bytes) -> str:
-    """ANSI-strip + normalize newlines -> the clean sticky-note text."""
+    """ANSI-strip + normalize newlines -> the clean sticky-note text.
+
+    NOT byte-exact: trims a leading newline some shells (e.g. fish's native C
+    mark) leak from the cursor repaint just before output, and rstrips the
+    tail for readability. Genuine leading/trailing whitespace or blank lines
+    the command itself printed are silently dropped too - see _clean_exact()
+    for a byte-exact alternative (issue #22)."""
     txt = _ANSI_RE.sub(b"", raw)
     txt = txt.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    # strip("\n") drops a leading newline some shells (e.g. fish's native C mark)
-    # leak from the cursor repaint just before output; rstrip() trims the tail.
     return txt.decode("utf-8", "replace").strip("\n").rstrip()
+
+
+def _clean_exact(raw: bytes) -> str:
+    """ANSI-strip + normalize newlines ONLY - no trimming. Byte-exact (modulo
+    ANSI/OSC stripping) counterpart to _clean(), for callers who need the
+    command's real output including leading/trailing whitespace and blank
+    lines (issue #22: the default `stdout` field is cleaned for readability
+    and was never actually byte-exact, despite older docs claiming it was)."""
+    txt = _ANSI_RE.sub(b"", raw)
+    txt = txt.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return txt.decode("utf-8", "replace")
 
 
 class StructureSource:
     def __init__(self, nonce=None, expect_unnonced_marks=False):
         self._buf = b""          # bytes not yet resolved (may hold a partial mark)
         self._state = "IDLE"     # IDLE | RUNNING
-        self._stdout = b""       # raw stdout accumulated while RUNNING
+        self._stdout = b""       # raw stdout accumulated while RUNNING (tail
+                                  # window only, once truncated - see _content)
+        self._stdout_head = None  # bytes: captured once, first _STDOUT_HEAD
+                                   # bytes, or None if never truncated
+        self._stdout_total = 0     # total bytes seen for the in-flight command
         self._nonce = nonce      # expected k=<hex> on C/D/A marks; None = accept all
         # Some shells have their OWN native OSC 133 emitter running alongside
         # ours (fish >= 4) that will never carry our nonce - that's expected,
@@ -106,7 +157,30 @@ class StructureSource:
 
     def partial_stdout(self) -> str:
         """Cleaned stdout captured so far for an in-flight command (post-C)."""
-        return _clean(self._stdout)
+        return _clean(self._current_stdout_bytes())
+
+    @property
+    def stdout_truncated(self) -> bool:
+        """True once the in-flight command's stdout has exceeded the cap."""
+        return self._stdout_head is not None
+
+    def _current_stdout_bytes(self) -> bytes:
+        """Compose the captured stdout, head+tail if truncated. Caller holds
+        no lock requirement beyond whatever the engine already uses."""
+        if self._stdout_head is None:
+            return bytes(self._stdout)
+        omitted = self._stdout_total - len(self._stdout_head) - len(self._stdout)
+        marker = f"\n...[cleat: {omitted} bytes omitted]...\n".encode()
+        return self._stdout_head + marker + bytes(self._stdout)
+
+    def _reset_stdout(self):
+        self._stdout = b""
+        self._stdout_head = None
+        self._stdout_total = 0
+
+    def partial_stdout_exact(self) -> str:
+        """Byte-exact (modulo ANSI-strip) counterpart to partial_stdout()."""
+        return _clean_exact(self._current_stdout_bytes())
 
     @property
     def idle(self) -> bool:
@@ -146,9 +220,19 @@ class StructureSource:
         return completed
 
     def _content(self, chunk: bytes):
-        """Bytes between marks: stdout only while a command is RUNNING."""
-        if self._state == "RUNNING" and chunk:
-            self._stdout += chunk
+        """Bytes between marks: stdout only while a command is RUNNING.
+        Bounded (issue #15): past _MAX_STDOUT, keep a fixed head window plus
+        a rolling tail window instead of growing for the whole command."""
+        if self._state != "RUNNING" or not chunk:
+            return
+        self._stdout += chunk
+        self._stdout_total += len(chunk)
+        if self._stdout_head is None:
+            if len(self._stdout) > _MAX_STDOUT:
+                self._stdout_head = bytes(self._stdout[:_STDOUT_HEAD])
+                self._stdout = self._stdout[-_STDOUT_TAIL:]
+        elif len(self._stdout) > _STDOUT_TAIL:
+            self._stdout = self._stdout[-_STDOUT_TAIL:]
 
     def _mark(self, payload: str):
         """Apply one mark's payload; return a CommandRecord if one just closed."""
@@ -171,7 +255,7 @@ class StructureSource:
 
         if code == "C":                      # command output begins
             self._state = "RUNNING"
-            self._stdout = b""
+            self._reset_stdout()
             self.commands_started += 1
             return None
 
@@ -182,9 +266,12 @@ class StructureSource:
             if len(parts) > 1 and re.fullmatch(r"-?\d+", parts[1]):
                 exit_code = int(parts[1])
             if self._state == "RUNNING":
-                rec = CommandRecord(stdout=_clean(self._stdout), exit_code=exit_code)
+                rec = CommandRecord(stdout=_clean(self._current_stdout_bytes()),
+                                     exit_code=exit_code,
+                                     truncated=self.stdout_truncated,
+                                     stdout_exact=_clean_exact(self._current_stdout_bytes()))
                 self._state = "IDLE"
-                self._stdout = b""
+                self._reset_stdout()
                 return rec
             # IDLE D. The shell's first precmd emits a spurious D;0 BEFORE the
             # first prompt is shown (no A, no command yet) - ignore that. But a D
