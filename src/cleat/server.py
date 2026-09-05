@@ -4,7 +4,7 @@ server.py - the MCP server. The agent-facing edge.
 
 Wraps the persistent Engine in an MCP tool so an agent gets the clean sticky
 note - {stdout, exit_code} - instead of the raw byte river. Reuses the official
-`mcp` SDK (FastMCP); the only bespoke part here is the tool schema, which is
+`mcp` SDK (MCPServer on 2.x, FastMCP on 1.x); the only bespoke part here is the tool schema, which is
 deliberately minimal: one persistent shell, one tool to run a command in it.
 
 Run it as an MCP stdio server:
@@ -43,14 +43,22 @@ own native emitter, counts as a forgery attempt.)
 """
 
 import atexit
+import threading
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp >= 2.0 renamed FastMCP to MCPServer and removed the old import path
+    from mcp.server.mcpserver import MCPServer as _Server
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP as _Server
 
 from .engine import Engine
 
-mcp = FastMCP("cleat")
+mcp = _Server("cleat")
 
 _engine = None
+# mcp >= 2 runs sync tool handlers on worker threads, so two concurrent first
+# calls could otherwise each spawn a shell. Engine methods serialize
+# themselves; this only guards the create/respawn decision.
+_engine_lock = threading.Lock()
 
 
 def _get_engine() -> Engine:
@@ -61,11 +69,12 @@ def _get_engine() -> Engine:
     "engine not started (or already closed)" forever, with no recovery short
     of restarting the whole MCP server process."""
     global _engine
-    if _engine is None or not _engine._alive:
-        if _engine is not None:
-            _engine.close()  # release its injected temp rcfile dir before replacing
-        _engine = Engine().start()
-    return _engine
+    with _engine_lock:
+        if _engine is None or not _engine._alive:
+            if _engine is not None:
+                _engine.close()  # release its injected temp rcfile dir before replacing
+            _engine = Engine().start()
+        return _engine
 
 
 @atexit.register
