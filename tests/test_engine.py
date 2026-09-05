@@ -282,6 +282,8 @@ def test_state_running_while_command_executes(eng):
     assert r["state"] == "running"
 
 
+@pytest.mark.skipif(not os.path.exists("/proc/self/wchan"),
+                    reason="possibly-awaiting-input is derived from /proc wchan (Linux only)")
 def test_state_possibly_awaiting_input_on_canonical_read(bash_eng):
     # Issue #27: a plain `read x` (or `cat` waiting on stdin) leaves the
     # terminal in CANONICAL mode with echo on, so termios alone can't tell
@@ -508,35 +510,59 @@ def test_terminal_query_bytes_in_command_output_not_answered(bash_eng):
     assert replies == [], f"query reply was injected into stdin: {writes}"
 
 
-def test_terminal_query_gate_blocks_after_first_prompt_outside_altscreen(bash_eng):
-    # Direct unit check of the gate itself, independent of real shell timing.
-    bash_eng._struct.prompts_seen = 1
+def _nonced(eng, code, exit_code=None):
+    """Build one of OUR marks (nonce-authenticated) for direct unit checks."""
+    k = eng._struct._nonce.encode()
+    body = b"D;%d;k=%s" % (exit_code, k) if code == "D" else b"C;k=" + k
+    return b"\x1b]133;" + body + b"\x07"
+
+
+def test_terminal_query_gate_blocks_inside_command_output(bash_eng):
+    # Direct unit check of the gate itself, independent of real shell timing:
+    # a query-looking sequence between our C mark and our D mark is the
+    # command's own output and must not be answered.
     bash_eng._altscreen = False
     writes = []
     bash_eng._proc.write = lambda data: writes.append(data)
-    bash_eng._answer_terminal_queries(b"\x1b[6n")
+    bash_eng._answer_terminal_queries(_nonced(bash_eng, "C") + b"\x1b[6n", was_idle=True)
+    # ...and a mark-less chunk arriving while a command is already in flight.
+    bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=False)
     assert writes == []
 
 
-def test_terminal_query_gate_allows_before_first_prompt(bash_eng):
-    # The one legitimate case this responder exists for: a shell/TUI probing
-    # terminal capabilities before it has ever shown a prompt (fish's own
-    # startup DA1 query).
-    bash_eng._struct.prompts_seen = 0
+def test_terminal_query_gate_allows_between_commands(bash_eng):
+    # fish >= 4 re-queries the terminal at every prompt - after its D mark,
+    # before the next C - and stalls until answered (this is what broke fish
+    # 4 after the gate first landed). Shell-owned bytes are answered whether
+    # the chunk starts idle or starts mid-command and crosses a D mark.
     bash_eng._altscreen = False
     writes = []
     bash_eng._proc.write = lambda data: writes.append(data)
-    bash_eng._answer_terminal_queries(b"\x1b[6n")
+    bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=True)
     assert writes == [b"\x1b[1;1R"]
+    writes.clear()
+    chunk = b"cmd output \x1b]11;?\x1b\\" + _nonced(bash_eng, "D", 0) + b"prompt \x1b[6n"
+    bash_eng._answer_terminal_queries(chunk, was_idle=False)
+    assert writes == [b"\x1b[1;1R"]     # cursor query after D answered, bg query before it not
+
+
+def test_terminal_query_gate_ignores_forged_unnonced_marks(bash_eng):
+    # A command can't end its own segment by printing a D mark: only marks
+    # carrying our nonce move the boundary.
+    bash_eng._altscreen = False
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(
+        _nonced(bash_eng, "C") + b"\x1b]133;D;0\x07\x1b[6n", was_idle=True)
+    assert writes == []
 
 
 def test_terminal_query_gate_allows_during_altscreen(bash_eng):
     # A full-screen program legitimately owns the terminal and may query it.
-    bash_eng._struct.prompts_seen = 5
     bash_eng._altscreen = True
     writes = []
     bash_eng._proc.write = lambda data: writes.append(data)
-    bash_eng._answer_terminal_queries(b"\x1b[6n")
+    bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=False)
     assert writes == [b"\x1b[1;1R"]
 
 
