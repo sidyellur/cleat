@@ -203,7 +203,7 @@ def test_wait_for_raises_if_not_started():
         e.wait_for(timeout=1.0)
 
 
-def test_wait_for_settle_window_survives_stale_non_running_state(bash_eng, monkeypatch):
+def test_wait_for_settle_window_survives_stale_non_running_state(bash_eng, monkeypatch, tmp_path):
     # Regression test for a race found via manual zsh testing while building
     # wait_for (PR #11): on zsh, the shell reclaims the foreground pgid and
     # re-enters its own raw ZLE mode the instant a child exits - a beat
@@ -214,8 +214,28 @@ def test_wait_for_settle_window_survives_stale_non_running_state(bash_eng, monke
     # force the exact misreading deterministically here (fg == shell pid,
     # ICANON off) on bash instead, so this is fast and 100% reproducible
     # regardless of which shells happen to be installed.
-    r = bash_eng.run_command("sleep 0.1; echo woke", timeout=0.02)
+    #
+    # The command blocks on a FIFO we control rather than a fixed sleep: the
+    # original `sleep 0.1` version raced twice over - on a cold shell the
+    # 20ms run_command timeout expired before bash had even read the line
+    # (so the session really was idle and the fake below wasn't a
+    # misreading), and the real completion had to land inside wait_for's
+    # 0.2s settle window from whenever the test happened to call it. Both
+    # failed on slower CI runners.
+    fifo = tmp_path / "gate"
+    os.mkfifo(fifo)
+    r = bash_eng.run_command(f"cat < {fifo}; echo woke", timeout=0.02)
     assert not r["completed"]                      # still running for real
+
+    # Wait for the C mark: only once the command is actually in flight is
+    # "fg == shell pid + icanon off" a MISreading rather than the truth.
+    deadline = time.monotonic() + 5.0
+    while True:
+        with bash_eng._cond:
+            if not bash_eng._struct.idle:
+                break
+        assert time.monotonic() < deadline, "command never started"
+        time.sleep(0.01)
 
     shell_pid = bash_eng._shell_pid
     monkeypatch.setattr(os, "tcgetpgrp", lambda fd: shell_pid)
@@ -230,9 +250,20 @@ def test_wait_for_settle_window_survives_stale_non_running_state(bash_eng, monke
     with bash_eng._cond:
         assert bash_eng._probe_state() == "awaiting-input"  # confirm the fake fools it
 
+    # Release the command a beat AFTER wait_for has started its settle
+    # window, so the real D mark arrives while the state is still (falsely)
+    # claiming "awaiting-input".
+    def _release():
+        time.sleep(0.05)
+        with open(fifo, "w") as f:
+            f.write("go\n")
+
+    t = threading.Thread(target=_release, daemon=True)
+    t.start()
     # Despite the state claiming "awaiting-input" throughout, the settle
     # window must still wait for the REAL completion instead of trusting it.
     r2 = bash_eng.wait_for(timeout=2.0)
+    t.join(2.0)
     assert r2["completed"] is True and r2["exit_code"] == 0
     assert "woke" in r2["output"]
 
