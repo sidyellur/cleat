@@ -48,6 +48,7 @@ stdin looks identical to a busy program by termios alone.
 import os
 import re
 import time
+import queue
 import shutil
 import threading
 import termios
@@ -138,9 +139,19 @@ class Engine:
         # Second consumer of the same byte stream: a virtual screen. pyte
         # interprets cursor moves/clears/colors so we can read what the terminal
         # *looks like* (clean REPL lines, rendered TUIs) - it ignores OSC 133,
-        # which the StructureSource handles instead.
+        # which the StructureSource handles instead. pyte is pure-Python and
+        # comparatively slow, so it's fed off the hot reader-thread path on
+        # its own queue/thread (issue #23) - otherwise a large streaming
+        # command would have the render backpressure draining the PTY for
+        # the whole session, not just screen-reading calls. _pyte_lock
+        # guards self._screen/self._pyte specifically (NOT self._cond) so a
+        # slow feed() never blocks run_command/read_output, which don't
+        # touch the screen at all.
         self._screen = pyte.Screen(cols, rows)
         self._pyte = pyte.ByteStream(self._screen)
+        self._pyte_lock = threading.Lock()
+        self._pyte_queue = queue.Queue()
+        self._pyte_thread = None
 
         # Shared state, guarded by _cond. The reader thread is the only writer;
         # callers read under the lock and wait on the cond. To stay bounded over
@@ -201,6 +212,8 @@ class Engine:
         self._alive = True
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        self._pyte_thread = threading.Thread(target=self._pyte_loop, daemon=True)
+        self._pyte_thread.start()
         if self._rcfile_to_unlink:
             # Wait for the shell's first output: by then it has already
             # fully read/sourced the injected rcfile during its own startup
@@ -263,10 +276,11 @@ class Engine:
                 # the two write paths are actually serialized instead of
                 # merely relying on os.write() being atomic at the kernel level.
                 self._answer_terminal_queries(data, was_idle)
-                try:
-                    self._pyte.feed(data)
-                except Exception:
-                    pass  # never let a rendering hiccup kill the read loop
+                # Hand off to the pyte thread (issue #23) instead of feeding
+                # synchronously here - this is the one part of draining the
+                # PTY that can be genuinely slow (pure-Python rendering), and
+                # nothing else on this hot path needs it.
+                self._pyte_queue.put(data)
                 # Bound memory: keep only the most recent _MAX_RAW bytes,
                 # regardless of whether a cursor has consumed them yet
                 # (issue #15) - during a single long/large-output command
@@ -290,6 +304,25 @@ class Engine:
         with self._cond:
             self._alive = False
             self._cond.notify_all()
+
+    def _pyte_loop(self):
+        """Feed the virtual screen off the reader thread (issue #23). Runs
+        under its own lock (_pyte_lock), never _cond, so a slow feed() can't
+        block run_command/read_output/wait_for - only screen-reading calls
+        (which need _render_screen's queue.join() to see it caught up)."""
+        while True:
+            try:
+                data = self._pyte_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not self._alive:
+                    break
+                continue
+            with self._pyte_lock:
+                try:
+                    self._pyte.feed(data)
+                except Exception:
+                    pass  # never let a rendering hiccup kill this loop
+            self._pyte_queue.task_done()
 
     def close(self):
         self._alive = False
@@ -331,7 +364,12 @@ class Engine:
                 self._proc.setwinsize(rows, cols)
             except Exception:
                 pass
-            self._screen.resize(rows, cols)
+            # Wait for any in-flight feed() to finish before resizing the
+            # same Screen object out from under it (issue #23: pyte now runs
+            # on its own thread/queue).
+            self._pyte_queue.join()
+            with self._pyte_lock:
+                self._screen.resize(rows, cols)
         return {"cols": cols, "rows": rows}
 
     @_serialized
@@ -417,11 +455,21 @@ class Engine:
         return chunk
 
     def _render_screen(self):
-        """Snapshot the virtual screen as text + cursor. Caller holds _cond."""
-        lines = [line.rstrip() for line in self._screen.display]
-        while lines and not lines[-1]:   # trim trailing blank rows
-            lines.pop()
-        return "\n".join(lines), [self._screen.cursor.x, self._screen.cursor.y]
+        """Snapshot the virtual screen as text + cursor. Caller holds _cond.
+
+        Waits for the pyte thread to catch up first (queue.join() blocks
+        until every chunk handed off so far has been fed) so this doesn't
+        render a stale screen - the tradeoff for moving feed() off the hot
+        reader-thread path (issue #23) is that screen-reading calls
+        specifically may briefly wait here if a lot of output is still
+        queued, instead of the OLD behavior of everything waiting on every
+        chunk's feed()."""
+        self._pyte_queue.join()
+        with self._pyte_lock:
+            lines = [line.rstrip() for line in self._screen.display]
+            while lines and not lines[-1]:   # trim trailing blank rows
+                lines.pop()
+            return "\n".join(lines), [self._screen.cursor.x, self._screen.cursor.y]
 
     def _probe_state(self):
         """Derive the session state from termios/fg-pgid facts instead of
