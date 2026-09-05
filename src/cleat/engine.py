@@ -123,6 +123,10 @@ class Engine:
         # Constructed in start() once we know the injection nonce (or lack
         # thereof); a pre-start placeholder so attribute access never 500s.
         self._struct = StructureSource()
+        # Matches OUR C/D marks (nonce-authenticated once start() knows the
+        # nonce) so _answer_terminal_queries can tell shell-owned bytes
+        # between commands from a command's own output. Placeholder until then.
+        self._cmd_mark_re = re.compile(rb"\x1b\]133;([CD])")
 
         # Second consumer of the same byte stream: a virtual screen. pyte
         # interprets cursor moves/clears/colors so we can read what the terminal
@@ -161,6 +165,11 @@ class Engine:
         native_marks_shell = os.path.basename(self.shell) == "fish"
         self._struct = StructureSource(nonce=nonce,
                                         expect_unnonced_marks=native_marks_shell)
+        if nonce:
+            # Only marks carrying our nonce delimit commands; a forged
+            # un-nonced mark in command output can't move the boundary.
+            self._cmd_mark_re = re.compile(
+                rb"\x1b\]133;([CD])[^\x07\x1b]*?;k=" + re.escape(nonce.encode()))
         # Always advertise xterm-256color, regardless of what TERM (if any)
         # this process inherited. We render via pyte - an xterm-class emulator
         # - so that's what the child should see; an inherited TERM lacking
@@ -191,6 +200,7 @@ class Engine:
             with self._cond:
                 # Feed under the lock so struct state (commands_started), the
                 # raw buffer, and the screen advance atomically for readers.
+                was_idle = self._struct.idle  # before this chunk, for the responder
                 recs = self._struct.feed(data)
                 self._raw += data
                 self._records.extend(recs)
@@ -211,7 +221,7 @@ class Engine:
                         self._altscreen_pgid = None
                 # Gated on struct/altscreen state AS OF THIS CHUNK (issue #16) -
                 # must run after the updates above, not before.
-                self._answer_terminal_queries(data)
+                self._answer_terminal_queries(data, was_idle)
                 try:
                     self._pyte.feed(data)
                 except Exception:
@@ -273,40 +283,58 @@ class Engine:
         return {"watch_root": self._watch_root}
 
     # -- internals ----------------------------------------------------------
-    def _answer_terminal_queries(self, data):
-        """Reply to terminal capability queries so probing programs don't block.
-
-        Some shells/TUIs (notably fish 4.x) refuse to draw a prompt until the
-        terminal answers DA1 / cursor-position / background-color queries. Under
-        a bare PTY nobody answers, so they hang forever. We send minimal canned
-        replies.
+    def _answer_terminal_queries(self, data, was_idle=True):
+        """Some shells (fish) and TUIs probe the terminal on startup, and fish
+        >= 4 re-probes at EVERY prompt: DA1 / cursor-position / background-
+        color queries that a real terminal answers. Under a bare PTY nobody
+        answers, so they hang - fish 4 stops processing input until its
+        per-prompt queries are answered, which stalled every command after
+        the first. We send minimal canned replies.
 
         Gated (issue #16): a command's OWN stdout can contain these same byte
         sequences - a `cat` on a binary/log file, a program that deliberately
         prints them - and blindly pattern-matching raw output let that
         command's own output forge input into the shell's stdin (a fake
-        cursor-position reply lands as if the human had typed it). We can't
-        attribute a byte sequence to "a real terminal query" vs. "a command's
-        output" at the byte level, so instead we only answer while a real
-        query is plausible: before the shell's very first prompt (fish's own
-        startup probing - the reason this responder exists) or while a
-        full-screen program legitimately owns the terminal (altscreen). Once
-        the shell has shown a prompt and isn't in altscreen, we no longer
-        answer - a TUI that queries before ever entering altscreen won't get
-        an answer either, but no case in the test suite needs that, and it's
-        the safer tradeoff.
+        cursor-position reply lands as if the human had typed it). The
+        boundary that tells the two apart is the OSC 133 marks: bytes between
+        our C mark and our D mark are the command's output and never
+        answered; bytes outside a command (shell startup, the prompt redraw
+        after D and before the next C) are the shell's own and are. Only
+        marks carrying our session nonce count as boundaries, so a command
+        can't forge its way out of its own segment. While a full-screen
+        program owns the terminal (altscreen) everything is answered - a TUI
+        legitimately queries its terminal and can't be told apart from
+        anything else at the byte level.
 
-        Caller holds _cond and has already fed `data` into self._struct and
-        updated self._altscreen for this chunk, so both reflect state
-        INCLUDING this read, not a chunk behind."""
-        if self._struct.prompts_seen > 0 and not self._altscreen:
-            return
+        `was_idle` is the structure source's idle state BEFORE this chunk
+        was fed (the caller fed it already and holds _cond), so a chunk with
+        no marks in it is classified by whether a command was already in
+        flight when it arrived. Marks split across a read boundary can
+        misclassify one chunk; best-effort, same as before."""
+        if self._altscreen:
+            segments = [data]
+        else:
+            segments = []
+            in_cmd = not was_idle
+            pos = 0
+            for m in self._cmd_mark_re.finditer(data):
+                if not in_cmd:
+                    segments.append(data[pos:m.start()])
+                in_cmd = m.group(1) == b"C"
+                pos = m.end()
+            if not in_cmd:
+                segments.append(data[pos:])
+        da1 = cpr = bg = False
+        for seg in segments:
+            da1 = da1 or b"\x1b[c" in seg or b"\x1b[0c" in seg
+            cpr = cpr or b"\x1b[6n" in seg
+            bg = bg or b"\x1b]11;?" in seg
         try:
-            if b"\x1b[c" in data or b"\x1b[0c" in data:
+            if da1:
                 self._proc.write(b"\x1b[?62;c")                      # DA1
-            if b"\x1b[6n" in data:
+            if cpr:
                 self._proc.write(b"\x1b[1;1R")                       # cursor pos
-            if b"\x1b]11;?" in data:
+            if bg:
                 self._proc.write(b"\x1b]11;rgb:0000/0000/0000\x1b\\")  # bg color
         except Exception:
             pass

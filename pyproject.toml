@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cleat"
-version = "0.2.1"
+version = "0.2.2"
 description = "A headless terminal layer: a persistent PTY + OSC 133 structure source, exposed to AI agents over MCP."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -22,7 +22,7 @@ classifiers = [
 dependencies = [
     "ptyprocess>=0.7",
     "pyte>=0.8",
-    "mcp>=1.0",
+    "mcp>=1.0",  # 1.x (FastMCP) and 2.x (MCPServer) both supported; see server.py
 ]
 
 [project.optional-dependencies]
