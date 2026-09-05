@@ -5,11 +5,14 @@ import json
 import os
 import shutil
 import sys
+import time
 
 import pytest
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+import cleat.server as server
 
 EXPECTED_TOOLS = {"run_command", "send_keys", "read_screen",
                   "resize", "watch_files", "read_output"}
@@ -48,3 +51,35 @@ def test_mcp_stdio_roundtrip():
                 assert r2["stdout"] in ("/tmp", "/private/tmp")
 
     asyncio.run(run())
+
+
+# -- dead engine recovery (issue #19) ---------------------------------------
+# Direct against server._get_engine() (not through the stdio transport): the
+# behavior under test is server.py's engine-lifecycle bookkeeping itself, and
+# this pins down the exact repro (run_command("exit") kills the shell;
+# _get_engine() must notice and hand back a fresh, usable engine instead of
+# the same dead one forever).
+def test_dead_engine_is_respawned_not_reused_forever(monkeypatch):
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not installed")
+    monkeypatch.setenv("SHELL", bash)
+    server._engine = None
+    try:
+        eng1 = server._get_engine()
+        eng1.run_command("exit")
+        # The reader thread notices EOF asynchronously; give it a moment.
+        for _ in range(50):
+            if not eng1._alive:
+                break
+            time.sleep(0.05)
+        assert not eng1._alive, "engine should be dead after the shell exited"
+
+        eng2 = server._get_engine()
+        assert eng2 is not eng1, "a dead engine must be replaced, not reused"
+        r = eng2.run_command("echo after-respawn")
+        assert r["stdout"] == "after-respawn" and r["exit_code"] == 0
+    finally:
+        if server._engine is not None:
+            server._engine.close()
+        server._engine = None

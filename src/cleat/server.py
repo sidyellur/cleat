@@ -4,7 +4,7 @@ server.py - the MCP server. The agent-facing edge.
 
 Wraps the persistent Engine in an MCP tool so an agent gets the clean sticky
 note - {stdout, exit_code} - instead of the raw byte river. Reuses the official
-`mcp` SDK (FastMCP); the only bespoke part here is the tool schema, which is
+`mcp` SDK (MCPServer on 2.x, FastMCP on 1.x); the only bespoke part here is the tool schema, which is
 deliberately minimal: one persistent shell, one tool to run a command in it.
 
 Run it as an MCP stdio server:
@@ -27,6 +27,10 @@ directly instead of polling-and-hoping:
     "tui"              a full-screen program (vim, top, less) owns the terminal;
                        use read_screen/send_keys, not run_command.
     "running"          a child is executing; poll read_output or wait.
+    "possibly-awaiting-input"  best-effort (Linux only): looks like a plain
+                       `read`/`cat`-style canonical-mode prompt rather than
+                       a busy program - try send_keys() with a line of input.
+
 
 run_command also carries "spoofed_marks" (only when > 0): a program run in
 this session tried to forge an OSC 133 completion mark. It can't alter the
@@ -39,22 +43,38 @@ own native emitter, counts as a forgery attempt.)
 """
 
 import atexit
+import threading
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp >= 2.0 renamed FastMCP to MCPServer and removed the old import path
+    from mcp.server.mcpserver import MCPServer as _Server
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP as _Server
 
 from .engine import Engine
 
-mcp = FastMCP("cleat")
+mcp = _Server("cleat")
 
 _engine = None
+# mcp >= 2 runs sync tool handlers on worker threads, so two concurrent first
+# calls could otherwise each spawn a shell. Engine methods serialize
+# themselves; this only guards the create/respawn decision.
+_engine_lock = threading.Lock()
 
 
 def _get_engine() -> Engine:
-    """Lazily start the persistent shell on first use, then reuse it."""
+    """Lazily start the persistent shell on first use, then reuse it - but
+    respawn a fresh one if the previous shell died (issue #19). The reader
+    loop flips Engine._alive to False when the shell exits/crashes; without
+    this check every call after that hit the same dead engine and raised
+    "engine not started (or already closed)" forever, with no recovery short
+    of restarting the whole MCP server process."""
     global _engine
-    if _engine is None:
-        _engine = Engine().start()
-    return _engine
+    with _engine_lock:
+        if _engine is None or not _engine._alive:
+            if _engine is not None:
+                _engine.close()  # release its injected temp rcfile dir before replacing
+            _engine = Engine().start()
+        return _engine
 
 
 @atexit.register
@@ -65,7 +85,7 @@ def _shutdown():
 
 
 @mcp.tool()
-def run_command(command: str, timeout: float = 10.0) -> dict:
+def run_command(command: str, timeout: float = 10.0, exact: bool = False) -> dict:
     """Run a shell command in a PERSISTENT terminal session.
 
     The session keeps state across calls: cd, exports, activated venvs, and ssh
@@ -80,16 +100,27 @@ def run_command(command: str, timeout: float = 10.0) -> dict:
       - spoofed_marks (only if > 0): a program this command ran tried to forge
         a completion mark. exit_code/stdout/completed are unaffected - they're
         authenticated - but treat that program's own output as untrusted.
+      - stdout is ANSI-stripped AND trimmed for readability (a leading newline
+        some shells leak, trailing whitespace) - it is NOT byte-exact. Pass
+        exact=True for an additional stdout_exact field: ANSI-stripped only,
+        preserving the command's real leading/trailing whitespace and blank
+        lines.
+
+    Raises an error if the session isn't idle (a REPL/TUI/prompt is still
+    open from a previous call): use send_keys() to drive it, or
+    wait_for()/read_output() until it's idle, before calling this again.
 
     Args:
         command: the shell command to run.
         timeout: seconds to wait for completion before returning partial (default 10).
+        exact: also return stdout_exact (byte-exact stdout, modulo ANSI stripping).
     """
-    return _get_engine().run_command(command, timeout=timeout)
+    return _get_engine().run_command(command, timeout=timeout, exact=exact)
 
 
 @mcp.tool()
-def send_keys(keys: str, enter: bool = False, timeout: float = 2.0) -> dict:
+def send_keys(keys: str, enter: bool = False, timeout: float = 2.0,
+              confirm_password_prompt: bool = False) -> dict:
     """Send input to a running interactive program (a REPL, a prompt, a TUI)
     started by run_command, then return the rendered screen.
 
@@ -97,11 +128,15 @@ def send_keys(keys: str, enter: bool = False, timeout: float = 2.0) -> dict:
     "\\u001b"=Esc. Set enter=True to append a newline. Returns {screen, cursor,
     exit_code, completed, state}; the screen is rendered by a virtual terminal
     so REPL/TUI output is clean (no per-keystroke redraw noise). completed=True
-    (with an exit_code) means the program exited. If the state you're driving
-    is "password" (see module docstring), only send input here with the human's
-    explicit consent - don't relay a secret on your own initiative.
+    (with an exit_code) means the program exited.
+
+    If the state you're driving is "password" (see module docstring), this
+    call raises an error unless confirm_password_prompt=True is passed - only
+    set that with the human's explicit consent for what's being sent; don't
+    relay a secret on your own initiative.
     """
-    return _get_engine().send_keys(keys, enter=enter, timeout=timeout)
+    return _get_engine().send_keys(keys, enter=enter, timeout=timeout,
+                                    confirm_password_prompt=confirm_password_prompt)
 
 
 @mcp.tool()
