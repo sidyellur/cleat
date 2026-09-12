@@ -581,6 +581,67 @@ def test_ctrl_c_interrupts(bash_eng):
     assert r["completed"] and r["exit_code"] is not None
 
 
+def test_run_command_large_heredoc_does_not_deadlock(bash_eng):
+    # Issue #65: run_command wrote its whole payload to the PTY while
+    # holding _cond. A canonical-mode PTY echoes each input line back to
+    # its own output side the instant it sees the newline, so a large
+    # multi-line command - a heredoc writing a file, an extremely common
+    # agent pattern - can fill the kernel's output queue faster than
+    # anything drains it. The only thing draining that queue is
+    # _read_loop's read() -> process-under-_cond cycle, so a write held
+    # under _cond long enough to hit that backpressure deadlocked
+    # permanently: the reader could never acquire _cond to process what
+    # it's already read, so it never looped back to read() again, so the
+    # queue never drained, so the write never unblocked either.
+    #
+    # Reproduced directly against a real bash session before this fix
+    # (not via CI - it hung indefinitely, so this test wasn't safe to add
+    # until fixed): a 1000-line heredoc completed in ~0.1s, a 5000-line one
+    # hung forever. This uses 8000 lines - comfortably past that threshold
+    # - on its own thread with a bounded join so a regression fails loudly
+    # instead of hanging the whole suite.
+    n = 8000
+    body = "\n".join(f"line{i}" for i in range(n))
+    cmd = f"cat <<'HEREDOC_EOF' > /dev/null\n{body}\nHEREDOC_EOF"
+    result = {}
+
+    def go():
+        result["r"] = bash_eng.run_command(cmd, timeout=20)
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(timeout=25.0)
+    assert not t.is_alive(), \
+        f"run_command hung on a {n}-line heredoc - looks like issue #65"
+    assert result["r"]["completed"] and result["r"]["exit_code"] == 0
+
+
+def test_send_keys_large_multiline_paste_does_not_deadlock(bash_eng):
+    # Issue #65, send_keys side: same deadlock, same fix (write outside
+    # _cond past the first small chunk) - see test_run_command_large_
+    # heredoc_does_not_deadlock and send_keys' own comment for the
+    # mechanism. Pasting a multi-line block into a running REPL is the
+    # send_keys analogue of a heredoc.
+    n = 8000
+    bash_eng.run_command("python3", timeout=5)
+    body = "\n".join(f"x={i}" for i in range(n))
+    result = {}
+
+    def go():
+        result["r"] = bash_eng.send_keys(body, enter=True, timeout=20)
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(timeout=25.0)
+    assert not t.is_alive(), \
+        f"send_keys hung on a {n}-line paste - looks like issue #65"
+    # The REPL is still mid-input (no D mark) right after the paste lands;
+    # confirm the session actually absorbed it rather than wedging silently
+    # by cleanly exiting and checking the exit code comes back at all.
+    r2 = bash_eng.send_keys("exit()", enter=True, timeout=5)
+    assert r2["completed"] and r2["exit_code"] == 0
+
+
 def test_pyte_feed_does_not_backpressure_pty_draining(bash_eng, monkeypatch):
     # Issue #23: pyte.feed() ran synchronously on the reader thread for every
     # chunk, so a pathologically slow render (pyte is pure-Python) delayed
