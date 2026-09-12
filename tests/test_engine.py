@@ -731,17 +731,36 @@ def test_read_screen_prompt_after_large_streaming_command(bash_eng):
     # stays capped. The command's OWN completion (a D mark, independent of
     # pyte entirely - issue #23) gets a generous 60s budget for slow/loaded
     # CI runners; wait_for() picks it up if run_command's own wait window
-    # wasn't enough. What the 15s bound below is actually checking is
-    # "read_screen returns in seconds, not stuck indefinitely behind the
-    # pyte backlog" - loose enough for a busy shared runner, not for a real
-    # regression back to the pre-#54 unbounded behavior.
+    # wasn't enough.
+    #
+    # The assertion below is checking "read_screen returns in bounded time,
+    # not stuck indefinitely behind the pyte backlog" - not a real
+    # regression back to the pre-#54 unbounded behavior. Note that
+    # read_screen's OWN `timeout` kwarg isn't what bounds this: by the time
+    # we get here the command has already completed and run_command's own
+    # polling has drained the raw buffer, so read_screen finds the struct
+    # already idle and the cursor already caught up, skips
+    # _read_until_idle() entirely, and goes straight to _render_screen() -
+    # whose self._pyte_queue.join() has NO timeout of its own. The wall-
+    # clock assertion just below is the only thing actually bounding this.
+    #
+    # That wait has to cover the WORST-CASE RESIDUAL still queued once the
+    # command completes, which is capped at _MAX_PYTE_BACKLOG (4 MiB)
+    # regardless of how large the total stream was - shrinking the stream
+    # itself wouldn't lower that residual. This failed on a loaded macOS CI
+    # runner at a 15s bound (twice, in two separate PRs): pyte's pure-Python
+    # per-byte rendering rate can drop well below its ordinary throughput
+    # under CPU contention, and 4 MiB at a throttled rate can plausibly take
+    # longer than that. 30s keeps this checking "bounded", not "instant",
+    # while giving a busy shared runner room a fixed multiple of the cap
+    # doesn't.
     r = bash_eng.run_command("head -c 20000000 /dev/zero | tr '\\0' x", timeout=60)
     if not r["completed"]:
         r = bash_eng.wait_for(timeout=60)
     assert r["completed"]
     t0 = time.monotonic()
-    scr = bash_eng.read_screen(timeout=15)
-    assert time.monotonic() - t0 < 15.0
+    scr = bash_eng.read_screen(timeout=30)
+    assert time.monotonic() - t0 < 30.0
     last_line = scr["screen"].splitlines()[-1] if scr["screen"] else ""
     assert last_line and last_line[-1] in "$#%", \
         f"screen didn't converge to a shell prompt: {scr['screen']!r}"
