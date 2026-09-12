@@ -87,6 +87,13 @@ _MAX_RECORDS = 256
 _MAX_PYTE_BACKLOG = 4 << 20  # 4 MiB
 _PYTE_COALESCE_TAIL = 64 * 1024
 
+# send_keys writes its payload in pieces this small (issue #65), all but
+# the first outside _cond entirely - see send_keys' own comment for why a
+# single long-held write can deadlock. Small enough that even the one
+# chunk written under _cond (the first, kept atomic with the password
+# check) can't itself be what fills the kernel's PTY buffers and blocks.
+_SEND_KEYS_CHUNK = 1024
+
 # Bounds for agent-supplied inputs at the MCP boundary (issue #52): without
 # these, e.g. resize(4000, 4000) makes every read_screen/send_keys render a
 # 16-million-cell pyte grid (multi-second, multi-MiB per call), and a huge or
@@ -778,7 +785,23 @@ class Engine:
         with self._cond:
             start_rc = self._rec_total()
             start_started = self._struct.commands_started
-            self._proc.write((cmd + "\n").encode())
+        # The write happens OUTSIDE _cond (issue #65): a canonical-mode PTY
+        # echoes each input line back to its own output side the instant it
+        # sees the newline, so a large multi-line command (a heredoc writing
+        # a file is the common agent pattern) can fill the kernel's output
+        # queue faster than anything drains it. The only thing draining that
+        # queue is _read_loop's read() -> process-under-_cond cycle; if THIS
+        # write were still holding _cond when the kernel's echo generation
+        # backs up and blocks, the reader could never acquire _cond to
+        # process what it's already read, so it would never loop back to
+        # read() again, so the queue would never drain, so this write would
+        # never unblock either - a permanent deadlock. Nothing else can run
+        # a conflicting run_command()/send_keys() meanwhile (@_serialized
+        # already holds _api_lock across this whole call), so releasing
+        # _cond here doesn't reopen any cross-call race - it only lets the
+        # reader thread keep doing its own, unrelated job.
+        self._proc.write((cmd + "\n").encode())
+        with self._cond:
             end = time.monotonic() + timeout
             prev_len = self._total()
             while self._alive:
@@ -981,7 +1004,58 @@ class Engine:
                     "with the human's explicit consent for what's being sent"
                 )
             start_rc = self._rec_total()
-            self._proc.write(payload.encode())
+            payload_bytes = payload.encode()
+            # Only the FIRST chunk is written here, still inside this same
+            # _cond hold right after the check - #53's guarantee, unchanged,
+            # for what it actually protects against: a check that's already
+            # stale by the time anything gets sent. A first chunk small
+            # enough to always fit the kernel's PTY buffers in one go (see
+            # _SEND_KEYS_CHUNK) can't itself be the thing that blocks.
+            self._proc.write(payload_bytes[:_SEND_KEYS_CHUNK])
+        pos = _SEND_KEYS_CHUNK
+        # Any REMAINING chunks are written outside _cond entirely (issue
+        # #65), each preceded by its own brief re-check - not one long-held
+        # write, and not a single check covering the whole payload:
+        #
+        # - A canonical-mode PTY echoes each input line back to its own
+        #   output side the instant it sees the newline, so a large multi-
+        #   line payload (pasting a block into a REPL, say) can fill the
+        #   kernel's output queue faster than anything drains it. The only
+        #   thing draining that queue is _read_loop's read() -> process-
+        #   under-_cond cycle, so a write held under _cond long enough to
+        #   hit that backpressure can deadlock exactly like run_command's
+        #   single held write could (see its own comment) - chunking alone
+        #   doesn't fix this if each chunk's write() is itself still made
+        #   while holding _cond, since any ONE of them can be the write
+        #   that blocks. They have to be OUTSIDE the lock, not just small.
+        # - Re-checking before each of these further chunks (not just once
+        #   at the very start) matters because #53's actual guarantee -
+        #   nothing gets relayed to a password prompt - has to hold for the
+        #   whole payload once a single call can take a while to fully
+        #   land, not just for whichever bytes happened to go out first.
+        #
+        # This does reopen a narrow window #53's original fix specifically
+        # closed: between one of these later checks passing and that
+        # chunk's write() actually reaching the PTY, the check is no longer
+        # inside the same _cond hold, so it's no longer that exact same
+        # guarantee - just a much smaller one (a released/reacquired lock,
+        # not an entire separate high-level operation running in between).
+        # Preferred over the alternative: a certain deadlock on any payload
+        # long enough to hit real PTY backpressure.
+        while pos < len(payload_bytes):
+            with self._cond:
+                if not self._alive:
+                    raise RuntimeError("engine closed mid-write")
+                if self._probe_state() == "password" and not confirm_password_prompt:
+                    raise RuntimeError(
+                        "session moved to a password prompt mid-write - "
+                        "pass confirm_password_prompt=True to continue, "
+                        "only with the human's explicit consent for what's "
+                        "being sent"
+                    )
+            self._proc.write(payload_bytes[pos:pos + _SEND_KEYS_CHUNK])
+            pos += _SEND_KEYS_CHUNK
+        with self._cond:
             self._read_until_idle(timeout, idle)
             done = self._rec_total() > start_rc
             exit_code = self._records[-1].exit_code if done else None
