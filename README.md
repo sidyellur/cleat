@@ -2,6 +2,11 @@
 
 [![CI](https://github.com/sidyellur/cleat/actions/workflows/ci.yml/badge.svg)](https://github.com/sidyellur/cleat/actions/workflows/ci.yml)
 
+`cleat` lets an AI agent use a real, persistent terminal session and actually
+know what happened — whether a command succeeded, what it printed, and
+whether it's still running — instead of guessing from a stream of raw
+terminal noise.
+
 **A headless terminal layer for AI agents.** `cleat` runs a *persistent* shell
 session behind a PTY, parses its byte stream for [OSC 133](https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md)
 shell-integration marks, and exposes it to an agent over [MCP](https://modelcontextprotocol.io)
