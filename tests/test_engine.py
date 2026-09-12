@@ -726,22 +726,58 @@ def test_pyte_pending_not_erased_by_coalesce_while_a_feed_is_in_flight(bash_eng,
 
 def test_read_screen_prompt_after_large_streaming_command(bash_eng):
     # Issue #54: under realistic (unslowed) rendering, read_screen() after a
-    # large streaming command must still return promptly - the bound above
-    # exists so pyte doesn't fall permanently behind, not just so memory
-    # stays capped. The command's OWN completion (a D mark, independent of
-    # pyte entirely - issue #23) gets a generous 60s budget for slow/loaded
-    # CI runners; wait_for() picks it up if run_command's own wait window
-    # wasn't enough. What the 15s bound below is actually checking is
-    # "read_screen returns in seconds, not stuck indefinitely behind the
-    # pyte backlog" - loose enough for a busy shared runner, not for a real
-    # regression back to the pre-#54 unbounded behavior.
+    # large streaming command must still EVENTUALLY converge on a shell
+    # prompt - the bound above exists so pyte doesn't fall PERMANENTLY
+    # behind, not so memory stays capped alone. The command's OWN completion
+    # (a D mark, independent of pyte entirely - issue #23) gets a generous
+    # 60s budget for slow/loaded CI runners; wait_for() picks it up if
+    # run_command's own wait window wasn't enough.
+    #
+    # What #54 actually guarantees is "bounded backlog, so this converges in
+    # BOUNDED time" - not "converges within any particular number of wall-
+    # clock seconds". That's a throughput property (pyte's real per-byte
+    # rendering rate against a fixed residual capped at _MAX_PYTE_BACKLOG,
+    # 4 MiB, regardless of how large the total stream was), not a real-time
+    # one, and read_screen()'s call into _render_screen() has NO timeout of
+    # its own once the struct is already idle and the cursor caught up (it
+    # skips _read_until_idle() and goes straight to the unconditional
+    # self._pyte_queue.join()) - so a single call can legitimately take
+    # however long a loaded CPU takes to feed that residual. A one-shot
+    # "assert this returned within N seconds" check is the wrong shape for
+    # that guarantee: it either has to be so generous it stops meaning
+    # anything, or it flakes on real (if rare) CI contention - this failed
+    # twice on two different jobs/platforms at 15s and then 30s, and 15+
+    # combined local runs across this sandbox's own 4 CPUs never reproduced
+    # it even once, consistent with transient shared-runner throughput dips
+    # rather than a logic bug (a real regression to fully-unbounded #54-era
+    # behavior would take drastically longer than any of this - potentially
+    # minutes for 20 MiB, not tens of seconds).
+    #
+    # So: run read_screen() on its own thread and give it a ceiling far
+    # above any plausible legitimate slowness (ORDERS of magnitude past the
+    # ~19s this takes locally) before calling it hung - that's the actual
+    # regression this guards against - then, once it DOES return, check the
+    # content unconditionally. This still fails hard and promptly on a real
+    # hang; it just stops conflating "eventually correct" with "fast".
     r = bash_eng.run_command("head -c 20000000 /dev/zero | tr '\\0' x", timeout=60)
     if not r["completed"]:
         r = bash_eng.wait_for(timeout=60)
     assert r["completed"]
+
+    result = {}
+
+    def call_read_screen():
+        result["scr"] = bash_eng.read_screen(timeout=5)
+
+    t = threading.Thread(target=call_read_screen, daemon=True)
     t0 = time.monotonic()
-    scr = bash_eng.read_screen(timeout=15)
-    assert time.monotonic() - t0 < 15.0
+    t.start()
+    t.join(timeout=180.0)
+    elapsed = time.monotonic() - t0
+    assert not t.is_alive(), (
+        f"read_screen() still hadn't returned after {elapsed:.1f}s - looks "
+        "like a real regression to unbounded pyte catch-up, not CI slowness")
+    scr = result["scr"]
     last_line = scr["screen"].splitlines()[-1] if scr["screen"] else ""
     assert last_line and last_line[-1] in "$#%", \
         f"screen didn't converge to a shell prompt: {scr['screen']!r}"
@@ -888,6 +924,59 @@ def test_terminal_query_gate_allows_during_altscreen(bash_eng):
     bash_eng._proc.write = lambda data: writes.append(data)
     bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=False)
     assert writes == [b"\x1b[1;1R"]
+
+
+def test_terminal_query_gate_blocks_child_that_never_emitted_a_mark(bash_eng, monkeypatch):
+    # Issue #61: a bash subshell `(...)` / brace group `{ ...; }` never fires
+    # the injected preexec mark at all (inject.py), so was_idle never leaves
+    # True for its whole run and the marks-based heuristic alone would treat
+    # its entire output as "between commands" - answering a query sitting in
+    # it. Simulate exactly that gap directly: was_idle=True (no marks ever
+    # fired), but a child - not the shell - currently owns the terminal.
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: bash_eng._shell_pid + 1)
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=True)
+    assert writes == [], \
+        "answered a query from a child's output the marks never bracketed"
+
+
+def test_terminal_query_gate_still_allows_between_commands_when_fg_is_shell(bash_eng, monkeypatch):
+    # Companion to the test above: the new foreground check must not
+    # suppress the ordinary between-commands path (fish's own per-prompt
+    # queries, in particular) when the shell itself genuinely owns the
+    # terminal.
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: bash_eng._shell_pid)
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=True)
+    assert writes == [b"\x1b[1;1R"]
+
+
+def test_subshell_query_does_not_corrupt_the_next_command(bash_eng):
+    # Issue #61 end-to-end: a bash subshell's OWN output containing a
+    # terminal query must not get answered - and if it did, the forged
+    # reply would land at the freshly-redrawn prompt as literal keystrokes,
+    # corrupting whatever command runs next. printf's OWN runtime escape
+    # decoding produces the query as real program output (writing a literal
+    # ESC byte as part of the typed command line would instead be consumed
+    # by bash's readline as a keystroke before the subshell ever ran).
+    writes = []
+    real_write = bash_eng._proc.write
+
+    def spy(data):
+        writes.append(data)
+        return real_write(data)
+
+    bash_eng._proc.write = spy
+    r1 = bash_eng.run_command(
+        "(printf '\\033[6n'; sleep 0.4; echo sub)", timeout=3)
+    assert r1["completed"]
+    r2 = bash_eng.run_command("echo canary", timeout=3)
+    assert r2 == {"stdout": "canary", "exit_code": 0,
+                  "completed": True, "state": "idle"}
+    assert b"\x1b[1;1R" not in writes, \
+        "a query inside the subshell's own output was answered"
 
 
 def test_terminal_query_gate_ignores_stale_altscreen_within_same_chunk(bash_eng):

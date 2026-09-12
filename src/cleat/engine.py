@@ -24,12 +24,17 @@ API:
     eng.run_command("python3", timeout=5)  # completed=False, stdout has the banner+'>>>'
     eng.send_keys("print(6*7)", enter=True)# {screen, cursor, exit_code, completed, state}
     eng.read_output()                      # poll a long-runner; {output, exit_code, completed, state}
+    eng.wait_for()                         # block until the session needs attention
+    eng.read_screen()                      # {screen, cursor, state} - the rendered grid
+    eng.resize(cols, rows)                 # {cols, rows}
+    eng.set_watch_root(path)               # enable files_changed on run_command
     eng.close()
 
-Scope: line-oriented interactive programs (REPLs, prompts, streaming output).
-Full-screen TUIs (vim/top) emit cursor-addressing that only means anything when
-rendered into a screen grid - that needs a terminal emulator (pyte) and is a
-separate step, not handled here.
+Scope: line-oriented interactive programs (REPLs, prompts, streaming output),
+plus full-screen TUIs (vim/top/less) via a second consumer of the same byte
+stream - a pyte virtual screen, fed off its own thread (issue #23) - so
+read_screen()/send_keys() can drive what a TUI's cursor-addressing means
+without run_command ever needing to understand it.
 
 Session-state oracle: every agent-facing result also carries a "state" field
 -  "idle" | "running" | "awaiting-input" | "password" | "tui" - derived from
@@ -61,7 +66,10 @@ from . import filewatch
 from .structure import StructureSource, _clean
 from .inject import prepare
 
-# Keep the raw-byte window bounded; the consumed prefix is dropped past this.
+# Keep the raw-byte window bounded, dropping the oldest bytes past this - see
+# _read_loop's own trim below (issue #15): unconditionally, not just once a
+# cursor has consumed them, or a single long-running command's own output
+# would grow this unbounded for its whole duration.
 _MAX_RAW = 1 << 20  # 1 MiB
 # Keep only the most recent records; older ones are evicted (callers use
 # absolute indices via _rec_base, so eviction is transparent).
@@ -531,9 +539,32 @@ class Engine:
         was fed (the caller fed it already and holds _cond), so a chunk with
         no marks in it is classified by whether a command was already in
         flight when it arrived. Marks split across a read boundary can
-        misclassify one chunk; best-effort, same as before."""
+        misclassify one chunk; best-effort, same as before.
+
+        The marks-based check above assumes every command gets bracketed by
+        a C/D pair, which isn't true on bash: a command whose first token is
+        a subshell `(...)` or brace group `{ ...; }` emits no preexec mark
+        at all (inject.py), so `was_idle` never leaves True for that
+        command's ENTIRE run. The heuristic above would then treat the
+        whole thing as "between commands" and answer any query byte
+        sequence sitting in that command's own output - a real cursor-
+        position reply forged straight into the shell's stdin, landing as
+        readline keystrokes ahead of whatever the agent runs next. So this
+        also checks the actual foreground process group: while a CHILD
+        genuinely owns the terminal, nothing is answered regardless of what
+        the marks-based check concludes, since that fact can't be forged by
+        anything the child prints (unlike a byte sequence in its output).
+        This doesn't change behavior for a normally-bracketed command (fg
+        already tracks in_cmd correctly there); it only closes the specific
+        gap where the marks never fired in the first place."""
+        try:
+            fg_is_shell = os.tcgetpgrp(self._proc.fd) == self._shell_pid
+        except OSError:
+            fg_is_shell = False  # unknown fg - the safer side is not answering
         if self._altscreen and not self._struct.idle:
             segments = [data]
+        elif not fg_is_shell:
+            segments = []
         else:
             segments = []
             in_cmd = not was_idle
