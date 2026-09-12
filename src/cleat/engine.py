@@ -254,6 +254,16 @@ class Engine:
                 recs = self._struct.feed(data)
                 self._raw += data
                 self._records.extend(recs)
+                if recs:
+                    # A D mark closed a command in this chunk (issue #48): a
+                    # full-screen program can't outlive its own command's D
+                    # mark (the shell's precmd only emits D after the
+                    # foreground program has exited), so whatever entered
+                    # altscreen before it is gone. Reset FIRST, then apply
+                    # this chunk's OWN altscreen matches below - so a TUI
+                    # launched later in the same chunk is still registered.
+                    self._altscreen = False
+                    self._altscreen_pgid = None
                 # Track alt-screen entry/exit for the state probe (state=="tui").
                 altscreen_matches = _ALTSCREEN_RE.findall(data)
                 if altscreen_matches:
@@ -403,16 +413,23 @@ class Engine:
         after D and before the next C) are the shell's own and are. Only
         marks carrying our session nonce count as boundaries, so a command
         can't forge its way out of its own segment. While a full-screen
-        program owns the terminal (altscreen) everything is answered - a TUI
-        legitimately queries its terminal and can't be told apart from
-        anything else at the byte level.
+        program owns the terminal (altscreen) AND a command is actually in
+        flight, everything is answered - a TUI legitimately queries its
+        terminal and can't be told apart from anything else at the byte
+        level. Requiring a command in flight too (issue #48) matters because
+        `self._altscreen` can otherwise go stale between commands: it's only
+        ever cleared by a later D mark or by _probe_state's own idle check,
+        so without this, an alt-screen sequence sitting harmlessly inside a
+        FILE some earlier command merely printed (e.g. `cat`) would leave
+        every later command's query-like bytes answered too, once the shell
+        is back at its own prompt.
 
         `was_idle` is the structure source's idle state BEFORE this chunk
         was fed (the caller fed it already and holds _cond), so a chunk with
         no marks in it is classified by whether a command was already in
         flight when it arrived. Marks split across a read boundary can
         misclassify one chunk; best-effort, same as before."""
-        if self._altscreen:
+        if self._altscreen and not self._struct.idle:
             segments = [data]
         else:
             segments = []
@@ -513,6 +530,11 @@ class Engine:
         try:
             fg = os.tcgetpgrp(self._proc.fd)
             if fg == self._shell_pid and self._struct.idle:
+                # Nothing owns the terminal but the shell itself: belt-and-
+                # braces reset (issue #48) for any path where a D mark was
+                # missed (see _read_loop's own reset on the normal path).
+                self._altscreen = False
+                self._altscreen_pgid = None
                 return "idle"
             if self._altscreen:
                 if self._altscreen_pgid is None or fg == self._altscreen_pgid:
