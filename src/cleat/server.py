@@ -112,7 +112,8 @@ def run_command(command: str, timeout: float = 10.0, exact: bool = False) -> dic
 
     Args:
         command: the shell command to run.
-        timeout: seconds to wait for completion before returning partial (default 10).
+        timeout: seconds to wait for completion before returning partial
+            (default 10). Must be finite and in (0, 3600].
         exact: also return stdout_exact (byte-exact stdout, modulo ANSI stripping).
     """
     return _get_engine().run_command(command, timeout=timeout, exact=exact)
@@ -134,6 +135,8 @@ def send_keys(keys: str, enter: bool = False, timeout: float = 2.0,
     call raises an error unless confirm_password_prompt=True is passed - only
     set that with the human's explicit consent for what's being sent; don't
     relay a secret on your own initiative.
+
+    timeout must be finite and in (0, 3600].
     """
     return _get_engine().send_keys(keys, enter=enter, timeout=timeout,
                                     confirm_password_prompt=confirm_password_prompt)
@@ -158,7 +161,7 @@ def read_screen() -> dict:
 def resize(cols: int, rows: int) -> dict:
     """Resize the terminal (PTY + virtual screen). Use before/while driving a
     full-screen TUI so it lays out for the size you want to read. Returns the
-    new {cols, rows}.
+    new {cols, rows}. cols and rows must each be in 1..500.
     """
     return _get_engine().resize(cols, rows)
 
@@ -182,6 +185,8 @@ def read_output(timeout: float = 2.0) -> dict:
     screen). Returns {output, exit_code, completed, state}; exit_code is set if
     a command finished while reading. For TUIs, prefer read_screen. See the
     module docstring for what each `state` value means and implies.
+
+    timeout must be finite and in (0, 3600].
     """
     return _get_engine().read_output(timeout=timeout)
 
@@ -203,6 +208,7 @@ def wait_for(timeout: float = 30.0) -> dict:
         timeout: max seconds to block before returning completed=False /
             state="running" (default 30 - longer than read_output's default
             since the point of this tool is to wait out a long-runner).
+            Must be finite and in (0, 3600].
     """
     return _get_engine().wait_for(timeout=timeout)
 
