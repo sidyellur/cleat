@@ -1,6 +1,12 @@
 """Unit tests for the OSC 133 parser - pure, fast, no PTY."""
 
-from cleat.structure import StructureSource, _clean, _clean_exact, _MAX_STDOUT
+import time
+
+import pytest
+
+from cleat.structure import (
+    StructureSource, _clean, _clean_exact, _MAX_STDOUT, _MAX_HELD_MARK,
+)
 
 
 def _pairs(recs):
@@ -233,3 +239,52 @@ def test_partial_stdout_truncated_flag_set_mid_command():
         src.feed(chunk)
     assert src.stdout_truncated is True
     assert len(src.partial_stdout()) < _MAX_STDOUT * 2
+
+
+# -- unbounded tail hold-back after a dangling ESC (issue #49) --------------
+
+def test_dangling_esc_does_not_hold_back_unbounded_tail():
+    # A colour reset (or any escape sequence) followed by a long run of
+    # plain output must not pin the rest of that output in _buf forever -
+    # only a byte sequence that could still complete an OSC 133 mark may be
+    # held back, and only up to _MAX_HELD_MARK bytes of it.
+    src = StructureSource()
+    src.feed(b"\x1b]133;C\x07")
+    src.feed(b"\x1b[0mStarting\r\n")  # a stray ESC with no 133 introducer after it
+    chunk = b"x" * 4096
+    t0 = time.perf_counter()
+    for _ in range(1000):             # ~4 MiB of ESC-free output
+        src.feed(chunk)
+        assert len(src._buf) <= _MAX_HELD_MARK
+    dt = time.perf_counter() - t0
+    assert dt < 2.0, f"took {dt:.2f}s - held-back tail is growing unbounded"
+    assert src.stdout_truncated is True
+
+
+def test_unterminated_introducer_is_flushed_past_cap():
+    # A hostile "\x1b]133;" that never gets a terminator must not hold back
+    # the buffer forever either - past _MAX_HELD_MARK it's treated as
+    # ordinary content instead.
+    src = StructureSource()
+    src.feed(b"\x1b]133;C\x07")
+    src.feed(b"\x1b]133;")            # a real introducer, no terminator yet
+    assert len(src._buf) <= _MAX_HELD_MARK  # still plausibly in-progress
+    src.feed(b"y" * (_MAX_HELD_MARK * 4))   # push well past the cap
+    assert len(src._buf) <= _MAX_HELD_MARK
+    assert b"y" in src.partial_stdout().encode()
+
+
+@pytest.mark.parametrize("terminator", [b"\x07", b"\x1b\\"])
+def test_mark_split_at_every_offset_recovers_exit_code(terminator):
+    # Whatever byte offset a read boundary falls at, splitting a C...D pair
+    # across two feed() calls must still yield exactly one record with the
+    # right exit code - regardless of terminator style (BEL or ST; the ST
+    # case also guards against issue #50, an ESC-\\ terminator split right
+    # between the two bytes).
+    stream = (b"\x1b]133;C" + terminator + b"hello"
+              + b"\x1b]133;D;0" + terminator)
+    for cut in range(1, len(stream)):
+        src = StructureSource()
+        recs = src.feed(stream[:cut]) + src.feed(stream[cut:])
+        assert _pairs(recs) == [("hello", 0)], (cut, recs, bytes(src._buf))
+        assert src.idle is True
