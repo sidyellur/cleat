@@ -45,6 +45,7 @@ model above admits it can't resolve - a plain `read x`/`cat` waiting on
 stdin looks identical to a busy program by termios alone.
 """
 
+import math
 import os
 import re
 import time
@@ -65,6 +66,25 @@ _MAX_RAW = 1 << 20  # 1 MiB
 # Keep only the most recent records; older ones are evicted (callers use
 # absolute indices via _rec_base, so eviction is transparent).
 _MAX_RECORDS = 256
+
+# Bounds for agent-supplied inputs at the MCP boundary (issue #52): without
+# these, e.g. resize(4000, 4000) makes every read_screen/send_keys render a
+# 16-million-cell pyte grid (multi-second, multi-MiB per call), and a huge or
+# non-finite timeout holds _api_lock for that long or reaches Condition.wait()
+# and raises from deep inside the engine. 500 is comfortably above any real
+# terminal size; 3600s is generous for even a very long-running command.
+MAX_DIM = 500
+MAX_TIMEOUT = 3600.0
+
+
+def _check_dims(cols, rows):
+    if not (1 <= cols <= MAX_DIM and 1 <= rows <= MAX_DIM):
+        raise ValueError(f"cols/rows must be in 1..{MAX_DIM}, got {cols}x{rows}")
+
+
+def _check_timeout(t):
+    if not (isinstance(t, (int, float)) and math.isfinite(t) and 0 < t <= MAX_TIMEOUT):
+        raise ValueError(f"timeout must be a finite number in (0, {MAX_TIMEOUT}], got {t!r}")
 
 # Alternate-screen enter/exit (DECSET/DECRST 1049, 1047, 47 - vim/less/top all
 # use one of these). 'h' enters, 'l' exits; last match in a chunk wins. A
@@ -118,6 +138,7 @@ def _serialized(method):
 
 class Engine:
     def __init__(self, shell=None, inject=True, cols=120, rows=40, watch_root=None):
+        _check_dims(cols, rows)
         self.shell = shell or os.environ.get("SHELL", "/bin/zsh")
         self.inject = inject
         self.dims = (rows, cols)
@@ -367,7 +388,10 @@ class Engine:
 
     @_serialized
     def resize(self, cols, rows):
-        """Resize both the PTY and the virtual screen so TUIs relay out."""
+        """Resize both the PTY and the virtual screen so TUIs relay out.
+
+        Raises ValueError if cols/rows are outside 1..MAX_DIM."""
+        _check_dims(cols, rows)
         with self._cond:
             self.dims = (rows, cols)
             try:
@@ -618,7 +642,10 @@ class Engine:
                  stdout_exact: ANSI-stripped only, no trimming - the
                  command's real output including leading/trailing whitespace
                  and blank lines (issue #22).
+
+        Raises ValueError if timeout is not finite and in (0, MAX_TIMEOUT].
         """
+        _check_timeout(timeout)
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
         with self._cond:
@@ -704,7 +731,10 @@ class Engine:
         """Poll for output without sending anything (e.g. watch a long-runner).
         Returns {output, exit_code, completed, state}; exit_code is set if a
         command finished while we were reading. See run_command for `state`
-        and `spoofed_marks`."""
+        and `spoofed_marks`.
+
+        Raises ValueError if timeout is not finite and in (0, MAX_TIMEOUT]."""
+        _check_timeout(timeout)
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
         with self._cond:
@@ -737,7 +767,10 @@ class Engine:
         the same shape as read_output(), but waits on the state oracle
         directly instead of an idle-silence window: no polling, no guessed
         intervals. Returns immediately if the session isn't "running" when
-        called (e.g. already sitting at a REPL prompt)."""
+        called (e.g. already sitting at a REPL prompt).
+
+        Raises ValueError if timeout is not finite and in (0, MAX_TIMEOUT]."""
+        _check_timeout(timeout)
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
         with self._cond:
@@ -776,7 +809,12 @@ class Engine:
         plus the cursor [x, y] and state. Briefly waits for output to settle
         first so a mid-redraw frame isn't captured. Use this for TUIs and
         REPLs; use read_output() for streaming text you don't want truncated
-        to the screen."""
+        to the screen.
+
+        Raises ValueError if settle/timeout are not finite and in
+        (0, MAX_TIMEOUT]."""
+        _check_timeout(settle)
+        _check_timeout(timeout)
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
         with self._cond:
@@ -804,7 +842,10 @@ class Engine:
         echo off, and this makes relaying anything there a deliberate,
         per-call opt-in instead of the default path - only pass True with
         the human's explicit consent for what's being sent.
+
+        Raises ValueError if timeout is not finite and in (0, MAX_TIMEOUT].
         """
+        _check_timeout(timeout)
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
         with self._cond:

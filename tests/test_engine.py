@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from cleat.engine import Engine, _MAX_RAW, _blocked_on_read
+from cleat.engine import Engine, _MAX_RAW, _blocked_on_read, MAX_DIM, MAX_TIMEOUT
 
 
 def _fish_supported(path):
@@ -865,3 +865,69 @@ def test_fish_no_doubled_records(fish_eng):
     fish_eng.run_command("echo two")
     fish_eng.run_command("echo three")
     assert fish_eng._struct.commands_started == 3
+
+
+# -- bounds on agent-supplied inputs at the MCP boundary (issue #52) -------
+
+def test_resize_rejects_out_of_range_dims(bash_eng):
+    with pytest.raises(ValueError):
+        bash_eng.resize(0, 10)
+    with pytest.raises(ValueError):
+        bash_eng.resize(10, 100000)
+    with pytest.raises(ValueError):
+        bash_eng.resize(-1, -1)
+    with pytest.raises(ValueError):
+        bash_eng.resize(MAX_DIM + 1, 10)
+    # In-range still works normally.
+    bash_eng.resize(200, 50)
+    r = bash_eng.run_command("tput cols")
+    assert r["stdout"] == "200"
+
+
+def test_engine_constructor_rejects_out_of_range_dims():
+    with pytest.raises(ValueError):
+        Engine(cols=0)
+    with pytest.raises(ValueError):
+        Engine(rows=MAX_DIM + 1)
+
+
+@pytest.mark.parametrize("bad_timeout", [
+    float("nan"), float("inf"), float("-inf"), -1, 0, MAX_TIMEOUT + 1,
+])
+def test_run_command_rejects_out_of_range_timeout(bash_eng, bad_timeout):
+    with pytest.raises(ValueError):
+        bash_eng.run_command("echo hi", timeout=bad_timeout)
+    # Rejected before anything touched the PTY: the session is still usable.
+    r = bash_eng.run_command("echo hi")
+    assert r["stdout"] == "hi" and r["exit_code"] == 0
+
+
+@pytest.mark.parametrize("bad_timeout", [
+    float("nan"), float("inf"), -1, 0,
+])
+def test_send_keys_rejects_out_of_range_timeout(bash_eng, bad_timeout):
+    bash_eng.run_command("python3", timeout=5)
+    with pytest.raises(ValueError):
+        bash_eng.send_keys("print(1)", enter=True, timeout=bad_timeout)
+    r = bash_eng.send_keys("exit()", enter=True)
+    assert r["completed"]
+
+
+@pytest.mark.parametrize("bad_timeout", [float("nan"), float("inf"), -1, 0])
+def test_read_output_rejects_out_of_range_timeout(bash_eng, bad_timeout):
+    with pytest.raises(ValueError):
+        bash_eng.read_output(timeout=bad_timeout)
+
+
+@pytest.mark.parametrize("bad_timeout", [float("nan"), float("inf"), -1, 0])
+def test_wait_for_rejects_out_of_range_timeout(bash_eng, bad_timeout):
+    with pytest.raises(ValueError):
+        bash_eng.wait_for(timeout=bad_timeout)
+
+
+@pytest.mark.parametrize("bad_timeout", [float("nan"), float("inf"), -1, 0])
+def test_read_screen_rejects_out_of_range_timeout(bash_eng, bad_timeout):
+    with pytest.raises(ValueError):
+        bash_eng.read_screen(timeout=bad_timeout)
+    with pytest.raises(ValueError):
+        bash_eng.read_screen(settle=bad_timeout)
