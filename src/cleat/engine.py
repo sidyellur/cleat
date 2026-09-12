@@ -606,6 +606,26 @@ class Engine:
         """Absolute count of records ever produced. Caller holds _cond."""
         return self._rec_base + len(self._records)
 
+    def _record_at(self, abs_index):
+        """The CommandRecord at absolute index `abs_index`, plus whether it
+        had already been evicted. Caller holds _cond.
+
+        _records is bounded (_MAX_RECORDS) and eviction advances _rec_base,
+        so an absolute index captured earlier can fall below _rec_base if
+        more than _MAX_RECORDS records closed in between - realistically only
+        a multi-line command string with hundreds of sub-commands all closing
+        before the waiter wakes (never reproduced even under contrived load,
+        but reachable in principle under OS-level starvation). Without this
+        check, `abs_index - _rec_base` goes negative and Python's negative
+        indexing silently returns some LATER record as if it were the one
+        asked for. Clamp to the oldest record still retained and say so, in
+        the same spirit as the other bounded-out cases: never a wrong answer
+        presented as a right one."""
+        idx = abs_index - self._rec_base
+        if idx < 0:
+            return self._records[0], True
+        return self._records[idx], False
+
     def _drain(self):
         """Return raw bytes since the cursor and advance it. Caller holds _cond."""
         chunk = bytes(self._raw[self._cursor - self._base:])
@@ -839,11 +859,11 @@ class Engine:
                 # The new record. Only ever one now: fish's native marks carry
                 # no nonce, so structure.py's nonce filtering ignores them
                 # entirely instead of emitting a second (empty) record.
-                rec = self._records[start_rc - self._rec_base]
+                rec, evicted = self._record_at(start_rc)
                 self._cursor = self._total()
                 result = {"stdout": rec.stdout, "exit_code": rec.exit_code,
                           "completed": True}
-                if rec.truncated:
+                if rec.truncated or evicted:
                     result["truncated"] = True
                 if exact:
                     result["stdout_exact"] = rec.stdout_exact
@@ -991,12 +1011,18 @@ class Engine:
             raise RuntimeError("engine not started (or already closed)")
         payload = keys + ("\n" if enter else "")
         with self._cond:
-            # The password-prompt check and the write must be one atomic
-            # step (issue #53): if they were two separate _cond acquisitions,
-            # the reader thread could run in between and the foreground
-            # program could switch the tty to a password prompt right after
-            # we checked, and the write would go through anyway - exactly
-            # the case this guard exists for.
+            # The password-prompt check and the (first chunk of the) write
+            # happen under one uninterrupted hold of _cond (issue #53): as
+            # two separate acquisitions, the reader thread could run in
+            # between and observe the foreground program switching the tty
+            # to a password prompt right after we checked, and the write
+            # would go through anyway. Holding _cond across both closes
+            # THAT interleaving - the one a userspace lock can close. It is
+            # not fully atomic against the child itself: its tcsetattr() is
+            # kernel-side, so ECHO can still flip in the microseconds between
+            # the tcgetattr() inside _probe_state() and the os.write(). No
+            # lock we hold can cover that residual window; it's inherent to
+            # checking termios state from outside the process that owns it.
             if self._probe_state() == "password" and not confirm_password_prompt:
                 raise RuntimeError(
                     "session is at a password prompt - pass "
