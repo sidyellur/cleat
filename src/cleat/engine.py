@@ -632,16 +632,24 @@ class Engine:
                 if self._rec_total() > start_rc:
                     break
                 cur_len = self._total()
-                c_seen = self._struct.commands_started > start_started
                 # Bail to "interactive" only when the command has started AND the
                 # parser has captured REAL stdout (not just terminal chrome like a
                 # title-set OSC) AND this wait added nothing. Keying on
                 # partial_stdout (ANSI/OSC-stripped) ignores the command echo
                 # (pre-C), silent commands like `sleep`, and post-C chrome that
                 # some shells (fish) emit before any output.
+                #
+                # Order matters (issue #51): this loop wakes on every
+                # notify_all() from the reader thread - once per PTY read, not
+                # just once per `idle` interval - and partial_stdout() does a
+                # full ANSI-strip + decode of the accumulated stdout (up to the
+                # #15 cap) while holding _cond, which stalls the reader thread.
+                # Check the cheap conditions first so it's only ever called on
+                # a wake-up that's actually idle, not on every chunk received.
                 idle_now = (cur_len == prev_len)
-                has_real_output = c_seen and bool(self._struct.partial_stdout())
-                if idle_now and has_real_output:
+                if (idle_now
+                        and self._struct.commands_started > start_started
+                        and self._struct.partial_stdout()):
                     break
                 prev_len = cur_len
 
