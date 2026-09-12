@@ -403,6 +403,54 @@ def test_send_keys_confirm_flag_irrelevant_outside_password_state(bash_eng):
     bash_eng.send_keys("exit()", enter=True)
 
 
+def test_send_keys_password_check_and_write_are_one_atomic_step(bash_eng):
+    # Issue #53: the password-prompt check and the PTY write must happen
+    # under one uninterrupted hold of _cond - two separate acquisitions
+    # would let the reader thread run in between, so the foreground program
+    # could flip to a password prompt right after the check and the write
+    # would go through anyway. Prove _cond is held continuously from the
+    # check through the write, the same technique as the #25 lock test:
+    # pause execution right after the check returns and confirm a second
+    # thread cannot acquire _cond in that window.
+    r = bash_eng.run_command("python3", timeout=5)
+    assert not r["completed"] and r["state"] == "awaiting-input"
+
+    real_probe = bash_eng._probe_state
+    check_done = threading.Event()
+    can_continue = threading.Event()
+    lock_was_free_after_check = threading.Event()
+    first_call = True
+
+    def spy_probe():
+        nonlocal first_call
+        result = real_probe()
+        if first_call:
+            first_call = False
+            check_done.set()
+            can_continue.wait(timeout=5.0)
+        return result
+
+    def watcher():
+        if not check_done.wait(timeout=5.0):
+            can_continue.set()
+            return
+        acquired = bash_eng._cond.acquire(blocking=False)
+        if acquired:
+            lock_was_free_after_check.set()
+            bash_eng._cond.release()
+        can_continue.set()
+
+    bash_eng._probe_state = spy_probe
+    t = threading.Thread(target=watcher)
+    t.start()
+    bash_eng.send_keys("print(1)", enter=True)
+    t.join(timeout=5)
+
+    assert not lock_was_free_after_check.is_set(), \
+        "_cond was released between the password check and the write"
+    bash_eng.send_keys("exit()", enter=True)
+
+
 def test_state_tui_then_idle_after_quit(bash_eng):
     if not shutil.which("vim"):
         pytest.skip("vim not installed")

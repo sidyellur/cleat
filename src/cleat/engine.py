@@ -785,15 +785,20 @@ class Engine:
         """
         if not self._alive:
             raise RuntimeError("engine not started (or already closed)")
+        payload = keys + ("\n" if enter else "")
         with self._cond:
+            # The password-prompt check and the write must be one atomic
+            # step (issue #53): if they were two separate _cond acquisitions,
+            # the reader thread could run in between and the foreground
+            # program could switch the tty to a password prompt right after
+            # we checked, and the write would go through anyway - exactly
+            # the case this guard exists for.
             if self._probe_state() == "password" and not confirm_password_prompt:
                 raise RuntimeError(
                     "session is at a password prompt - pass "
                     "confirm_password_prompt=True to send input here, only "
                     "with the human's explicit consent for what's being sent"
                 )
-        payload = keys + ("\n" if enter else "")
-        with self._cond:
             start_rc = self._rec_total()
             self._proc.write(payload.encode())
             self._read_until_idle(timeout, idle)
