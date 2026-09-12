@@ -890,6 +890,59 @@ def test_terminal_query_gate_allows_during_altscreen(bash_eng):
     assert writes == [b"\x1b[1;1R"]
 
 
+def test_terminal_query_gate_blocks_child_that_never_emitted_a_mark(bash_eng, monkeypatch):
+    # Issue #61: a bash subshell `(...)` / brace group `{ ...; }` never fires
+    # the injected preexec mark at all (inject.py), so was_idle never leaves
+    # True for its whole run and the marks-based heuristic alone would treat
+    # its entire output as "between commands" - answering a query sitting in
+    # it. Simulate exactly that gap directly: was_idle=True (no marks ever
+    # fired), but a child - not the shell - currently owns the terminal.
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: bash_eng._shell_pid + 1)
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=True)
+    assert writes == [], \
+        "answered a query from a child's output the marks never bracketed"
+
+
+def test_terminal_query_gate_still_allows_between_commands_when_fg_is_shell(bash_eng, monkeypatch):
+    # Companion to the test above: the new foreground check must not
+    # suppress the ordinary between-commands path (fish's own per-prompt
+    # queries, in particular) when the shell itself genuinely owns the
+    # terminal.
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: bash_eng._shell_pid)
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=True)
+    assert writes == [b"\x1b[1;1R"]
+
+
+def test_subshell_query_does_not_corrupt_the_next_command(bash_eng):
+    # Issue #61 end-to-end: a bash subshell's OWN output containing a
+    # terminal query must not get answered - and if it did, the forged
+    # reply would land at the freshly-redrawn prompt as literal keystrokes,
+    # corrupting whatever command runs next. printf's OWN runtime escape
+    # decoding produces the query as real program output (writing a literal
+    # ESC byte as part of the typed command line would instead be consumed
+    # by bash's readline as a keystroke before the subshell ever ran).
+    writes = []
+    real_write = bash_eng._proc.write
+
+    def spy(data):
+        writes.append(data)
+        return real_write(data)
+
+    bash_eng._proc.write = spy
+    r1 = bash_eng.run_command(
+        "(printf '\\033[6n'; sleep 0.4; echo sub)", timeout=3)
+    assert r1["completed"]
+    r2 = bash_eng.run_command("echo canary", timeout=3)
+    assert r2 == {"stdout": "canary", "exit_code": 0,
+                  "completed": True, "state": "idle"}
+    assert b"\x1b[1;1R" not in writes, \
+        "a query inside the subshell's own output was answered"
+
+
 def test_terminal_query_gate_ignores_stale_altscreen_within_same_chunk(bash_eng):
     # Issue #48 edge case: if a command's own C...D-wrapped output happens to
     # contain BOTH a fake alt-screen-enter sequence and query-like bytes, and

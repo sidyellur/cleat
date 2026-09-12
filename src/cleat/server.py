@@ -4,8 +4,9 @@ server.py - the MCP server. The agent-facing edge.
 
 Wraps the persistent Engine in an MCP tool so an agent gets the clean sticky
 note - {stdout, exit_code} - instead of the raw byte river. Reuses the official
-`mcp` SDK (MCPServer on 2.x, FastMCP on 1.x); the only bespoke part here is the tool schema, which is
-deliberately minimal: one persistent shell, one tool to run a command in it.
+`mcp` SDK (MCPServer on 2.x, FastMCP on 1.x); the only bespoke part here is the
+tool schema, which is deliberately minimal: one persistent shell, driven by
+run_command/read_output/wait_for/send_keys/read_screen/resize/watch_files.
 
 Run it as an MCP stdio server:
 

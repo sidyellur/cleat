@@ -165,7 +165,11 @@ the path and read the nonce out, even if it discovers it via
   preserving the command's real output exactly.
 - **bash:** a command whose *first token* is a subshell `(...)` or brace group
   `{ ...; }` emits no start mark; its exit code is recovered but stdout for that
-  one command is not captured.
+  one command is not captured. cleat still refuses to answer a terminal query
+  sitting in that command's own output — that check is against the real
+  foreground process, not the (here, missing) mark — so this doesn't reopen
+  the forged-input gap the marks close for every other command; but the
+  missing mark is real, so avoid this shape where the captured stdout matters.
 - **Full-screen TUIs:** use `read_screen` (the rendered grid), not `run_command`.
 - **Shells:** zsh and bash are fully supported, including interactive REPL/TUI
   driving. fish is supported for command execution on **≥4** (its own native
