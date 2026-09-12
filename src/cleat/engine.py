@@ -66,6 +66,18 @@ _MAX_RAW = 1 << 20  # 1 MiB
 # absolute indices via _rec_base, so eviction is transparent).
 _MAX_RECORDS = 256
 
+# Cap how much un-rendered output can queue up for the pyte thread (issue
+# #54): pyte is pure Python and renders far slower than a PTY can deliver
+# output (a big `cat`, a verbose build), so without a bound the backlog - the
+# entire un-rendered output - grows for the whole command, unbounded by any
+# of the caps above. Past this, the backlog is collapsed into a single
+# synthetic "clear the screen, then replay the last _PYTE_COALESCE_TAIL
+# bytes" chunk: the virtual screen may skip intermediate frames under heavy
+# output, but converges to the right final picture - the same tradeoff _raw
+# eviction (#15) already makes for the raw byte log.
+_MAX_PYTE_BACKLOG = 4 << 20  # 4 MiB
+_PYTE_COALESCE_TAIL = 64 * 1024
+
 # Alternate-screen enter/exit (DECSET/DECRST 1049, 1047, 47 - vim/less/top all
 # use one of these). 'h' enters, 'l' exits; last match in a chunk wins. A
 # sequence split across two reads is acceptable to miss for v0.2 - pyte's
@@ -152,6 +164,16 @@ class Engine:
         self._pyte_lock = threading.Lock()
         self._pyte_queue = queue.Queue()
         self._pyte_thread = None
+        # Bytes currently queued for the pyte thread, not yet fed (issue
+        # #54). Guarded by its OWN lock, never _pyte_lock or _cond: a slow
+        # feed() holds _pyte_lock for the whole render (that's the point of
+        # #23 - the reader thread must never wait on it), so if _read_loop
+        # needed _pyte_lock just to update this counter on every chunk, it
+        # would reintroduce exactly the backpressure #23 removed. _cond is
+        # out too since resize()/_render_screen() hold it across a blocking
+        # _pyte_queue.join().
+        self._pyte_pending = 0
+        self._pyte_pending_lock = threading.Lock()
 
         # Shared state, guarded by _cond. The reader thread is the only writer;
         # callers read under the lock and wait on the cond. To stay bounded over
@@ -290,7 +312,33 @@ class Engine:
                 # synchronously here - this is the one part of draining the
                 # PTY that can be genuinely slow (pure-Python rendering), and
                 # nothing else on this hot path needs it.
-                self._pyte_queue.put(data)
+                # _pyte_pending_lock only ever guards this counter, never a
+                # feed() call, so this check can't block on the slow render
+                # _pyte_lock protects (issue #54 - see the lock's own comment).
+                with self._pyte_pending_lock:
+                    if self._pyte_pending + len(data) > _MAX_PYTE_BACKLOG:
+                        # The pyte thread can't keep up: collapse whatever's
+                        # still queued into one "clear + recent tail" chunk
+                        # instead of letting the backlog grow unbounded.
+                        # Drain with get_nowait() (not a fresh Queue()) so
+                        # every already-queued item still gets its
+                        # task_done() - queue.join() below depends on that
+                        # accounting staying correct.
+                        backlog = bytearray()
+                        try:
+                            while True:
+                                backlog += self._pyte_queue.get_nowait()
+                                self._pyte_queue.task_done()
+                        except queue.Empty:
+                            pass
+                        backlog += data
+                        synthetic = (b"\x1b[2J\x1b[H"
+                                     + bytes(backlog[-_PYTE_COALESCE_TAIL:]))
+                        self._pyte_queue.put(synthetic)
+                        self._pyte_pending = len(synthetic)
+                    else:
+                        self._pyte_queue.put(data)
+                        self._pyte_pending += len(data)
                 # Bound memory: keep only the most recent _MAX_RAW bytes,
                 # regardless of whether a cursor has consumed them yet
                 # (issue #15) - during a single long/large-output command
@@ -319,7 +367,13 @@ class Engine:
         """Feed the virtual screen off the reader thread (issue #23). Runs
         under its own lock (_pyte_lock), never _cond, so a slow feed() can't
         block run_command/read_output/wait_for - only screen-reading calls
-        (which need _render_screen's queue.join() to see it caught up)."""
+        (which need _render_screen's queue.join() to see it caught up).
+
+        Under heavy output the queued backlog is bounded and coalesced by
+        _read_loop (issue #54), so the virtual screen may skip intermediate
+        frames and converge on a cleared screen plus the most recent bytes
+        rather than replaying every chunk - the same tradeoff _raw eviction
+        (#15) makes for the raw byte log."""
         while True:
             try:
                 data = self._pyte_queue.get(timeout=0.5)
@@ -332,6 +386,8 @@ class Engine:
                     self._pyte.feed(data)
                 except Exception:
                     pass  # never let a rendering hiccup kill this loop
+            with self._pyte_pending_lock:
+                self._pyte_pending = max(0, self._pyte_pending - len(data))
             self._pyte_queue.task_done()
 
     def close(self):
