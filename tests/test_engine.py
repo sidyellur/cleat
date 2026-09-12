@@ -591,13 +591,17 @@ def test_query_responder_write_serialized_with_api_writes(bash_eng):
     t = threading.Thread(target=watcher)
     t.start()
     # The responder is gated (issue #16): query-looking bytes inside a
-    # command's own output (between our C and D marks) are never answered.
-    # Pretend a full-screen program owns the terminal so this one query IS
-    # answered - what's under test here is the locking around the write,
-    # not the gate (covered separately below).
-    bash_eng._altscreen = True
-    bash_eng._altscreen_pgid = None
-    bash_eng.run_command(r"printf '\033[6n'", timeout=5)
+    # command's own output (between our C and D marks) are never answered -
+    # UNLESS a full-screen program legitimately owns the terminal. Make the
+    # command genuinely enter alt-screen itself (real code path, driven by
+    # _read_loop off real output - issue #48 tightened the gate to also
+    # require a command still be in flight, so this can no longer be forced
+    # by just poking `_altscreen` on an otherwise-idle engine) so this one
+    # query IS answered - what's under test here is the locking around the
+    # write, not the gate (covered separately elsewhere). The trailing sleep
+    # keeps the query write's chunk from being coalesced with the command's
+    # closing D mark.
+    bash_eng.run_command(r"printf '\033[?1049h\033[6n'; sleep 0.2", timeout=5)
     t.join(timeout=5)
 
     assert query_write_seen.is_set(), "query-responder write never triggered"
@@ -672,12 +676,37 @@ def test_terminal_query_gate_ignores_forged_unnonced_marks(bash_eng):
 
 
 def test_terminal_query_gate_allows_during_altscreen(bash_eng):
-    # A full-screen program legitimately owns the terminal and may query it.
+    # A full-screen program legitimately owns the terminal and may query it -
+    # but only while a command (the TUI itself) is actually in flight
+    # (issue #48): put the struct source into RUNNING first, same as a real
+    # TUI session would be.
+    bash_eng._struct.feed(_nonced(bash_eng, "C"))
     bash_eng._altscreen = True
     writes = []
     bash_eng._proc.write = lambda data: writes.append(data)
     bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=False)
     assert writes == [b"\x1b[1;1R"]
+
+
+def test_terminal_query_gate_ignores_stale_altscreen_within_same_chunk(bash_eng):
+    # Issue #48 edge case: if a command's own C...D-wrapped output happens to
+    # contain BOTH a fake alt-screen-enter sequence and query-like bytes, and
+    # the D mark that closes it lands in the SAME read chunk, _read_loop's
+    # ordering (reset on the D mark, then reapply this chunk's own altscreen
+    # matches) can leave `_altscreen` True by the time this runs even though
+    # the struct is already back to idle - the command that "entered"
+    # altscreen finished within this very chunk. The responder must still
+    # not answer the command's own query bytes in that case.
+    data = (_nonced(bash_eng, "C") + b"\x1b[?1049h" + b"\x1b[6n"
+            + _nonced(bash_eng, "D", 0))
+    bash_eng._struct.feed(data)          # mirrors _read_loop's own feed() call
+    assert bash_eng._struct.idle          # the D mark closed it within this chunk
+    bash_eng._altscreen = True            # mirrors _read_loop re-setting it from
+                                           # this chunk's own (fake) enter sequence
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(data, was_idle=True)
+    assert writes == []
 
 
 def test_run_command_default_stdout_trimmed_not_exact(bash_eng):
@@ -770,6 +799,36 @@ def test_stale_altscreen_cleared_when_tui_dies_uncleanly(bash_eng):
 
     r = bash_eng.run_command("sleep 0.5", timeout=0.2)
     assert r["state"] == "running", f"stale altscreen misclassified state: {r}"
+
+
+def test_altscreen_flag_cleared_after_command_completes(bash_eng):
+    # Issue #48 repro: a command whose OUTPUT merely contains an alt-screen
+    # enter sequence (not a real TUI - e.g. `cat` on a file with one inside
+    # it) must not leave `_altscreen` stuck True after that command
+    # finishes and the shell is back at an idle prompt.
+    bash_eng.run_command(r"printf '\033[?1049h' > /tmp/cleat_test_evil_48.txt; "
+                          r"printf 'plain\n' >> /tmp/cleat_test_evil_48.txt")
+    r = bash_eng.run_command("cat /tmp/cleat_test_evil_48.txt")
+    assert r["completed"] and r["state"] == "idle"
+    assert bash_eng._altscreen is False, \
+        "altscreen flag left stale after the command that set it completed"
+
+
+def test_stale_altscreen_does_not_leak_replies_into_next_command(bash_eng):
+    # Issue #48 repro, end to end: without the fix, the stale flag from the
+    # command above makes a LATER command's own output (containing
+    # query-like bytes) get answered - and those canned replies land in the
+    # shell's stdin as if typed, corrupting the agent's next command.
+    bash_eng.run_command(r"printf '\033[?1049h' > /tmp/cleat_test_evil_48b.txt")
+    bash_eng.run_command("cat /tmp/cleat_test_evil_48b.txt")
+    bash_eng.run_command(
+        r"printf '\033[6n\033[c\033]11;?\a' > /tmp/cleat_test_evil_48c.txt; "
+        r"printf 'more\n' >> /tmp/cleat_test_evil_48c.txt")
+    bash_eng.run_command("cat /tmp/cleat_test_evil_48c.txt")
+    time.sleep(0.3)
+    r = bash_eng.run_command("echo INTENDED_COMMAND")
+    assert r["stdout"] == "INTENDED_COMMAND"
+    assert r["exit_code"] == 0
 
 
 def test_tui_renders_and_quits(bash_eng):
