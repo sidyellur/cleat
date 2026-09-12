@@ -726,41 +726,58 @@ def test_pyte_pending_not_erased_by_coalesce_while_a_feed_is_in_flight(bash_eng,
 
 def test_read_screen_prompt_after_large_streaming_command(bash_eng):
     # Issue #54: under realistic (unslowed) rendering, read_screen() after a
-    # large streaming command must still return promptly - the bound above
-    # exists so pyte doesn't fall permanently behind, not just so memory
-    # stays capped. The command's OWN completion (a D mark, independent of
-    # pyte entirely - issue #23) gets a generous 60s budget for slow/loaded
-    # CI runners; wait_for() picks it up if run_command's own wait window
-    # wasn't enough.
+    # large streaming command must still EVENTUALLY converge on a shell
+    # prompt - the bound above exists so pyte doesn't fall PERMANENTLY
+    # behind, not so memory stays capped alone. The command's OWN completion
+    # (a D mark, independent of pyte entirely - issue #23) gets a generous
+    # 60s budget for slow/loaded CI runners; wait_for() picks it up if
+    # run_command's own wait window wasn't enough.
     #
-    # The assertion below is checking "read_screen returns in bounded time,
-    # not stuck indefinitely behind the pyte backlog" - not a real
-    # regression back to the pre-#54 unbounded behavior. Note that
-    # read_screen's OWN `timeout` kwarg isn't what bounds this: by the time
-    # we get here the command has already completed and run_command's own
-    # polling has drained the raw buffer, so read_screen finds the struct
-    # already idle and the cursor already caught up, skips
-    # _read_until_idle() entirely, and goes straight to _render_screen() -
-    # whose self._pyte_queue.join() has NO timeout of its own. The wall-
-    # clock assertion just below is the only thing actually bounding this.
+    # What #54 actually guarantees is "bounded backlog, so this converges in
+    # BOUNDED time" - not "converges within any particular number of wall-
+    # clock seconds". That's a throughput property (pyte's real per-byte
+    # rendering rate against a fixed residual capped at _MAX_PYTE_BACKLOG,
+    # 4 MiB, regardless of how large the total stream was), not a real-time
+    # one, and read_screen()'s call into _render_screen() has NO timeout of
+    # its own once the struct is already idle and the cursor caught up (it
+    # skips _read_until_idle() and goes straight to the unconditional
+    # self._pyte_queue.join()) - so a single call can legitimately take
+    # however long a loaded CPU takes to feed that residual. A one-shot
+    # "assert this returned within N seconds" check is the wrong shape for
+    # that guarantee: it either has to be so generous it stops meaning
+    # anything, or it flakes on real (if rare) CI contention - this failed
+    # twice on two different jobs/platforms at 15s and then 30s, and 15+
+    # combined local runs across this sandbox's own 4 CPUs never reproduced
+    # it even once, consistent with transient shared-runner throughput dips
+    # rather than a logic bug (a real regression to fully-unbounded #54-era
+    # behavior would take drastically longer than any of this - potentially
+    # minutes for 20 MiB, not tens of seconds).
     #
-    # That wait has to cover the WORST-CASE RESIDUAL still queued once the
-    # command completes, which is capped at _MAX_PYTE_BACKLOG (4 MiB)
-    # regardless of how large the total stream was - shrinking the stream
-    # itself wouldn't lower that residual. This failed on a loaded macOS CI
-    # runner at a 15s bound (twice, in two separate PRs): pyte's pure-Python
-    # per-byte rendering rate can drop well below its ordinary throughput
-    # under CPU contention, and 4 MiB at a throttled rate can plausibly take
-    # longer than that. 30s keeps this checking "bounded", not "instant",
-    # while giving a busy shared runner room a fixed multiple of the cap
-    # doesn't.
+    # So: run read_screen() on its own thread and give it a ceiling far
+    # above any plausible legitimate slowness (ORDERS of magnitude past the
+    # ~19s this takes locally) before calling it hung - that's the actual
+    # regression this guards against - then, once it DOES return, check the
+    # content unconditionally. This still fails hard and promptly on a real
+    # hang; it just stops conflating "eventually correct" with "fast".
     r = bash_eng.run_command("head -c 20000000 /dev/zero | tr '\\0' x", timeout=60)
     if not r["completed"]:
         r = bash_eng.wait_for(timeout=60)
     assert r["completed"]
+
+    result = {}
+
+    def call_read_screen():
+        result["scr"] = bash_eng.read_screen(timeout=5)
+
+    t = threading.Thread(target=call_read_screen, daemon=True)
     t0 = time.monotonic()
-    scr = bash_eng.read_screen(timeout=30)
-    assert time.monotonic() - t0 < 30.0
+    t.start()
+    t.join(timeout=180.0)
+    elapsed = time.monotonic() - t0
+    assert not t.is_alive(), (
+        f"read_screen() still hadn't returned after {elapsed:.1f}s - looks "
+        "like a real regression to unbounded pyte catch-up, not CI slowness")
+    scr = result["scr"]
     last_line = scr["screen"].splitlines()[-1] if scr["screen"] else ""
     assert last_line and last_line[-1] in "$#%", \
         f"screen didn't converge to a shell prompt: {scr['screen']!r}"
