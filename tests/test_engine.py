@@ -632,7 +632,9 @@ def test_pyte_queue_backlog_bounded_under_heavy_output(bash_eng, monkeypatch):
 
     t = threading.Thread(target=sampler)
     t.start()
-    r = bash_eng.run_command("head -c 20000000 /dev/zero | tr '\\0' x", timeout=30)
+    r = bash_eng.run_command("head -c 20000000 /dev/zero | tr '\\0' x", timeout=60)
+    if not r["completed"]:
+        r = bash_eng.wait_for(timeout=60)
     done.set()
     t.join()
 
@@ -645,9 +647,16 @@ def test_read_screen_prompt_after_large_streaming_command(bash_eng):
     # Issue #54: under realistic (unslowed) rendering, read_screen() after a
     # large streaming command must still return promptly - the bound above
     # exists so pyte doesn't fall permanently behind, not just so memory
-    # stays capped. 15s is generous slack for a shared/loaded CI runner;
-    # what matters is "seconds, not indefinitely stuck behind the backlog".
-    r = bash_eng.run_command("head -c 20000000 /dev/zero | tr '\\0' x", timeout=30)
+    # stays capped. The command's OWN completion (a D mark, independent of
+    # pyte entirely - issue #23) gets a generous 60s budget for slow/loaded
+    # CI runners; wait_for() picks it up if run_command's own wait window
+    # wasn't enough. What the 15s bound below is actually checking is
+    # "read_screen returns in seconds, not stuck indefinitely behind the
+    # pyte backlog" - loose enough for a busy shared runner, not for a real
+    # regression back to the pre-#54 unbounded behavior.
+    r = bash_eng.run_command("head -c 20000000 /dev/zero | tr '\\0' x", timeout=60)
+    if not r["completed"]:
+        r = bash_eng.wait_for(timeout=60)
     assert r["completed"]
     t0 = time.monotonic()
     scr = bash_eng.read_screen(timeout=15)
