@@ -643,6 +643,87 @@ def test_pyte_queue_backlog_bounded_under_heavy_output(bash_eng, monkeypatch):
         f"pyte backlog grew unbounded: {max_pending} bytes"
 
 
+def test_pyte_pending_not_erased_by_coalesce_while_a_feed_is_in_flight(bash_eng, monkeypatch):
+    # Regression for a bug in the #54 fix itself: the coalesce branch in
+    # _read_loop set self._pyte_pending = len(synthetic) outright instead of
+    # adjusting it by a delta. _pyte_loop only decrements _pyte_pending
+    # AFTER a feed() call returns, so whenever a coalesce fired while an
+    # earlier item was still checked out and mid-feed - the common case
+    # under sustained output, since coalescing only happens because pyte
+    # can't keep up - that in-flight item's still-uncounted contribution
+    # got wiped by the overwrite. When _pyte_loop later subtracted that
+    # item's length from a counter that no longer reflected it, pending
+    # drifted toward zero (clamped there by max(0, ...)) well before the
+    # backlog was actually empty, silently disabling the cap for the rest
+    # of the command. That's what made
+    # test_read_screen_prompt_after_large_streaming_command fail on a
+    # slower/more contended CI runner: the screen never caught up because
+    # the bound had stopped firing partway through the 20 MiB stream.
+    #
+    # Reproduced deterministically here instead of racing a real 20 MiB
+    # stream against runner speed: shrink the backlog cap so ANY second
+    # chunk coalesces, block the very first feed() call so its bytes stay
+    # in flight (dequeued, not yet decremented), and check the pending
+    # counter once a coalesce has fired behind it.
+    import cleat.engine as engine_mod
+    monkeypatch.setattr(engine_mod, "_MAX_PYTE_BACKLOG", 1)
+
+    real_feed = bash_eng._pyte.feed
+    first_call = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    def gated_feed(data):
+        if not calls:
+            calls.append(len(data))
+            first_call.set()
+            release_first.wait(timeout=5.0)
+        else:
+            calls.append(len(data))
+        return real_feed(data)
+
+    monkeypatch.setattr(bash_eng._pyte, "feed", gated_feed)
+
+    # A real gap between two writes, not just "echo one" alone: under full-
+    # suite load a single tiny command's preexec mark, echo, postcmd marks
+    # and prompt redraw can all land in ONE read() before the reader thread
+    # gets scheduled, leaving nothing left to coalesce (this reproduced as a
+    # flake the first time this test was written). The sleep guarantees the
+    # reader thread has already drained "AAAA" into the blocked first
+    # feed() call before "BBBB" is even written, regardless of system load.
+    r = bash_eng.run_command("printf AAAA; sleep 0.5; printf BBBB", timeout=8, idle=2.0)  # idle above the sleep so it isn't mistaken for completion
+    assert r["completed"]
+    assert first_call.wait(timeout=5.0), "pyte thread never started feeding"
+
+    # With the cap forced to 1, every one of the command's own remaining
+    # marks/output coalesces into (at most) a single queued item while the
+    # first feed() sits blocked - _pyte_loop can't dequeue anything else
+    # until released.
+    deadline = time.monotonic() + 6.0
+    while bash_eng._pyte_queue.qsize() == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    queued = list(bash_eng._pyte_queue.queue)
+    assert queued, ("expected a coalesced chunk to have queued behind the "
+                     "in-flight first feed - test didn't trigger the race")
+    assert len(queued) == 1, "coalescing should leave at most one queued item"
+    queued_len = len(queued[0])
+    first_len = calls[0]
+
+    with bash_eng._pyte_pending_lock:
+        pending_while_first_in_flight = bash_eng._pyte_pending
+
+    release_first.set()
+    bash_eng._pyte_queue.join()  # drain before the fixture tears down
+
+    assert pending_while_first_in_flight == first_len + queued_len, (
+        "the first item's in-flight bytes were erased by a concurrent "
+        f"coalesce: pending={pending_while_first_in_flight}, expected "
+        f"{first_len} (in-flight) + {queued_len} (queued) "
+        f"= {first_len + queued_len}"
+    )
+
+
 def test_read_screen_prompt_after_large_streaming_command(bash_eng):
     # Issue #54: under realistic (unslowed) rendering, read_screen() after a
     # large streaming command must still return promptly - the bound above

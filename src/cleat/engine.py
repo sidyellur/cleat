@@ -345,10 +345,33 @@ class Engine:
                         # every already-queued item still gets its
                         # task_done() - queue.join() below depends on that
                         # accounting staying correct.
+                        #
+                        # _pyte_pending can ALSO include an item _pyte_loop
+                        # currently has checked out and is mid-feed() on -
+                        # get_nowait() here never sees that item (it's
+                        # already out of the queue), so this drain only
+                        # touches what's still queued. Track exactly how
+                        # many of those bytes we're removing (drained_total)
+                        # and adjust pending by that delta rather than
+                        # overwriting it outright: an outright `= len(
+                        # synthetic)` would silently erase any in-flight
+                        # item's contribution, and when _pyte_loop later
+                        # subtracts that item's length from a counter that
+                        # no longer reflects it, pending drifts toward zero
+                        # and the bound above stops firing for the rest of
+                        # the command - which is exactly what happened
+                        # before this fix (issue #54 follow-up): under
+                        # sustained output there is almost always an
+                        # in-flight item when the next coalesce triggers, so
+                        # this raced on every large command, just not
+                        # severely enough to fail the test on every runner.
                         backlog = bytearray()
+                        drained_total = 0
                         try:
                             while True:
-                                backlog += self._pyte_queue.get_nowait()
+                                chunk = self._pyte_queue.get_nowait()
+                                drained_total += len(chunk)
+                                backlog += chunk
                                 self._pyte_queue.task_done()
                         except queue.Empty:
                             pass
@@ -356,7 +379,7 @@ class Engine:
                         synthetic = (b"\x1b[2J\x1b[H"
                                      + bytes(backlog[-_PYTE_COALESCE_TAIL:]))
                         self._pyte_queue.put(synthetic)
-                        self._pyte_pending = len(synthetic)
+                        self._pyte_pending += len(synthetic) - drained_total
                     else:
                         self._pyte_queue.put(data)
                         self._pyte_pending += len(data)
