@@ -581,6 +581,39 @@ def test_ctrl_c_interrupts(bash_eng):
     assert r["completed"] and r["exit_code"] is not None
 
 
+def test_record_at_flags_an_evicted_record_instead_of_negative_indexing(bash_eng):
+    # _records is bounded and eviction advances _rec_base, so an absolute
+    # record index captured before a burst of completions can end up below
+    # _rec_base. `abs_index - _rec_base` then goes negative, and Python's
+    # negative indexing would silently hand back some LATER record as if it
+    # were the one asked for. This is only reachable when more than
+    # _MAX_RECORDS records close between a write and the waiter waking -
+    # never reproduced naturally, even with the cap monkeypatched to 1 under
+    # contrived CPU starvation - so construct the state directly and check
+    # the lookup itself: clamp to the oldest retained record and flag it.
+    bash_eng.run_command("echo one")
+    bash_eng.run_command("echo two")
+    bash_eng.run_command("echo three")
+    with bash_eng._cond:
+        assert bash_eng._rec_total() == 3
+        # Pretend the first two records were evicted: _records now starts at
+        # absolute index 2, exactly what a real eviction of 2 leaves behind.
+        del bash_eng._records[:2]
+        bash_eng._rec_base += 2
+        assert [r.stdout for r in bash_eng._records] == ["three"]
+
+        # An index still retained resolves normally, not flagged.
+        rec, evicted = bash_eng._record_at(2)
+        assert rec.stdout == "three" and evicted is False
+
+        # An index that's been evicted: before the fix this computed
+        # _records[-2] (IndexError here with one record, but a silently
+        # WRONG record whenever more are retained) - now it clamps to the
+        # oldest survivor and reports the eviction.
+        rec, evicted = bash_eng._record_at(0)
+        assert rec.stdout == "three" and evicted is True
+
+
 def test_run_command_large_heredoc_does_not_deadlock(bash_eng):
     # Issue #65: run_command wrote its whole payload to the PTY while
     # holding _cond. A canonical-mode PTY echoes each input line back to
