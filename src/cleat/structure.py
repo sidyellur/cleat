@@ -93,6 +93,19 @@ _MAX_STDOUT = 1 << 20  # 1 MiB
 _STDOUT_HEAD = _MAX_STDOUT // 2
 _STDOUT_TAIL = _MAX_STDOUT // 2
 
+# The introducer every OSC 133 mark starts with; feed()'s tail hold-back
+# (below) only holds back bytes that could still complete one of these.
+_INTRODUCER = b"\x1b]133;"
+
+# Cap how much of the buffer feed() will hold back waiting for a mark to
+# complete (issue #49): a real mark (introducer + payload like "D;-5;k=<16
+# hex>" + a 1-2 byte terminator) is well under this. Without a cap, a
+# hostile program that emits an introducer and never terminates it (or
+# never sends a byte at all after one) would make feed() hold back and
+# re-scan an ever-growing buffer forever - past this many bytes it's
+# treated as ordinary content instead.
+_MAX_HELD_MARK = 256
+
 
 @dataclass
 class CommandRecord:
@@ -134,9 +147,40 @@ def _clean_exact(raw: bytes) -> str:
     return txt.decode("utf-8", "replace")
 
 
+def _held_back_start(buf) -> int:
+    """Earliest index in `buf` (bytes-like, no complete mark in it) that must
+    be held back for the next feed() because it could still grow into a
+    complete OSC 133 mark - a proper prefix of the introducer "\\x1b]133;",
+    or a full introducer followed by payload with no terminator yet. Bytes
+    before that index cannot be part of any mark and are safe to treat as
+    content now. Returns len(buf) if nothing needs holding back.
+
+    A candidate ESC whose runout already exceeds _MAX_HELD_MARK is not a
+    real in-progress mark (a legitimate one is a few dozen bytes at most) -
+    it's skipped and scanning continues, so a hostile unterminated
+    introducer doesn't hold back an ever-growing tail forever."""
+    pos = 0
+    n = len(buf)
+    while True:
+        i = buf.find(b"\x1b", pos)
+        if i == -1:
+            return n
+        remaining = n - i
+        introducer_len = min(remaining, len(_INTRODUCER))
+        if bytes(buf[i:i + introducer_len]) == _INTRODUCER[:introducer_len]:
+            if remaining <= _MAX_HELD_MARK:
+                return i
+            # Too long to plausibly still complete - treat as content and
+            # keep looking for a later, genuine candidate.
+        pos = i + 1
+
+
 class StructureSource:
     def __init__(self, nonce=None, expect_unnonced_marks=False):
-        self._buf = b""          # bytes not yet resolved (may hold a partial mark)
+        self._buf = bytearray()  # bytes not yet resolved (may hold a partial mark);
+                                  # bytearray so the held-back tail (bounded by
+                                  # _MAX_HELD_MARK) can be trimmed from the front
+                                  # in place instead of copying on every feed()
         self._state = "IDLE"     # IDLE | RUNNING
         self._stdout = b""       # raw stdout accumulated while RUNNING (tail
                                   # window only, once truncated - see _content)
@@ -200,22 +244,26 @@ class StructureSource:
             m = _MARK_RE.search(self._buf)
             if not m:
                 break
-            self._content(self._buf[: m.start()])
+            self._content(bytes(self._buf[: m.start()]))
             rec = self._mark(m.group(1).decode("ascii", "replace"))
             if rec is not None:
                 completed.append(rec)
-            self._buf = self._buf[m.end() :]
+            del self._buf[: m.end()]
 
-        # Whatever's left has no complete mark. The tail from the last ESC
-        # onward might be a mark cut in half by a read boundary - hold it back.
-        # Everything before it is safe to consume as content now.
-        last_esc = self._buf.rfind(b"\x1b")
-        if last_esc == -1:
-            self._content(self._buf)
-            self._buf = b""
-        else:
-            self._content(self._buf[:last_esc])
-            self._buf = self._buf[last_esc:]
+        # Whatever's left has no complete mark. Only hold back bytes that
+        # could still become one - a prefix of the introducer, or an
+        # introducer with payload but no terminator yet, capped at
+        # _MAX_HELD_MARK (issue #49). Everything else - a stray ESC from an
+        # unrelated escape sequence (a colour reset, say) with no OSC 133
+        # introducer following it - is ordinary content and must not be
+        # held back: holding back from the LAST ESC in the buffer regardless
+        # of what follows it (the old behavior) let a single colour code
+        # early in a command's output pin the entire rest of that command's
+        # bytes in _buf, unbounded and re-scanned on every feed() call.
+        hold_from = _held_back_start(self._buf)
+        if hold_from:
+            self._content(bytes(self._buf[:hold_from]))
+            del self._buf[:hold_from]
 
         return completed
 
