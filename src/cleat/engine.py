@@ -563,12 +563,28 @@ class Engine:
         anything the child prints (unlike a byte sequence in its output).
         This doesn't change behavior for a normally-bracketed command (fg
         already tracks in_cmd correctly there); it only closes the specific
-        gap where the marks never fired in the first place."""
+        gap where the marks never fired in the first place.
+
+        The alt-screen rule needs the same treatment (issue #70):
+        `self._altscreen` is set from a byte sequence in the OUTPUT stream
+        (`ESC [ ? 1049 h`), which a command's own output controls just as
+        much as the query bytes do - so `cat` on a file containing that
+        sequence followed by a query would otherwise be answered wholesale,
+        forging input into the shell exactly as #16/#61 describe. What a
+        real full-screen program does that a printed byte sequence can't is
+        put the terminal into raw/cbreak mode via tcsetattr(): ICANON off is
+        a kernel-held fact. So the alt-screen rule only applies while the
+        terminal is actually in non-canonical mode; a hostile PROGRAM that
+        switches to raw mode itself is indistinguishable from a TUI (already
+        the documented residual), but the "hostile data, not hostile
+        program" vector - a file, a log line - is closed."""
         try:
             fg_is_shell = os.tcgetpgrp(self._proc.fd) == self._shell_pid
-        except OSError:
+            raw_mode = not (termios.tcgetattr(self._proc.fd)[3] & termios.ICANON)
+        except (OSError, termios.error):
             fg_is_shell = False  # unknown fg - the safer side is not answering
-        if self._altscreen and not self._struct.idle:
+            raw_mode = False
+        if self._altscreen and not self._struct.idle and raw_mode:
             segments = [data]
         elif not fg_is_shell:
             segments = []
@@ -661,11 +677,18 @@ class Engine:
                                awaiting-input.
           2. tui             - alt-screen active (vim/top/less) AND the fg
                                pgid still matches whichever process entered
-                               it. A TUI killed without emitting its rmcup
+                               it AND the terminal is in non-canonical mode.
+                               A TUI killed without emitting its rmcup
                                exit sequence (SIGKILL, crash) leaves the flag
                                set; once something ELSE owns the foreground,
                                it's stale and cleared instead of trusted
-                               (issue #17).
+                               (issue #17). The ICANON check (issue #70)
+                               keeps a canonical-mode `cat` of a file that
+                               merely CONTAINS the alt-screen sequence from
+                               being reported as a TUI: the flag came from
+                               output bytes, the mode comes from the
+                               kernel, and a real full-screen program always
+                               sets the latter.
           3. password        - ECHO off, ICANON on (sudo, read -s, getpass).
           4. awaiting-input  - ICANON off: a readline/libedit line editor is
                                provably blocked on input.
@@ -697,18 +720,25 @@ class Engine:
                 self._altscreen = False
                 self._altscreen_pgid = None
                 return "idle"
-            if self._altscreen:
-                if self._altscreen_pgid is None or fg == self._altscreen_pgid:
-                    return "tui"
-                # fg has moved to a different process group than the one
-                # that entered altscreen: that program is gone (died without
-                # rmcup) and whatever's foreground now isn't a TUI we saw
-                # enter altscreen. Don't trust the stale flag.
-                self._altscreen = False
-                self._altscreen_pgid = None
             lflag = termios.tcgetattr(self._proc.fd)[3]
             echo = bool(lflag & termios.ECHO)
             icanon = bool(lflag & termios.ICANON)
+            if self._altscreen:
+                if self._altscreen_pgid is None or fg == self._altscreen_pgid:
+                    if not icanon:
+                        return "tui"
+                    # Same process that "entered" altscreen still owns the
+                    # terminal, but it never left canonical mode: a plain
+                    # program printing the sequence (issue #70), not a TUI.
+                    # Leave the flag for the D mark to clear as usual and
+                    # classify from termios like any other child.
+                else:
+                    # fg has moved to a different process group than the
+                    # one that entered altscreen: that program is gone (died
+                    # without rmcup) and whatever's foreground now isn't a
+                    # TUI we saw enter altscreen. Don't trust the stale flag.
+                    self._altscreen = False
+                    self._altscreen_pgid = None
             if not echo and icanon:
                 return "password"
             if not icanon:

@@ -884,7 +884,7 @@ def test_pyte_screen_correct_after_small_output(bash_eng):
     assert "hi" in scr["screen"]
 
 
-def test_query_responder_write_serialized_with_api_writes(bash_eng):
+def test_query_responder_write_serialized_with_api_writes(bash_eng, monkeypatch):
     # Issue #25: _answer_terminal_queries writes to the PTY master from the
     # reader thread; run_command/send_keys write to it from the API thread
     # while holding _cond. If the reader thread's write happens OUTSIDE
@@ -932,7 +932,12 @@ def test_query_responder_write_serialized_with_api_writes(bash_eng):
     # query IS answered - what's under test here is the locking around the
     # write, not the gate (covered separately elsewhere). The trailing sleep
     # keeps the query write's chunk from being coalesced with the command's
-    # closing D mark.
+    # closing D mark. Since issue #70 the alt-screen rule also requires the
+    # terminal to really be in raw mode - which a printf can't do and a
+    # genuine TUI always does - so report that fact for this test, the same
+    # way the gate's own unit tests do.
+    monkeypatch.setattr(termios, "tcgetattr",
+                        _tcgetattr_with_icanon(termios.tcgetattr, icanon=False))
     bash_eng.run_command(r"printf '\033[?1049h\033[6n'; sleep 0.2", timeout=5)
     t.join(timeout=5)
 
@@ -1007,17 +1012,100 @@ def test_terminal_query_gate_ignores_forged_unnonced_marks(bash_eng):
     assert writes == []
 
 
-def test_terminal_query_gate_allows_during_altscreen(bash_eng):
+def _tcgetattr_with_icanon(real_tcgetattr, icanon):
+    """A tcgetattr reporting ICANON on/off regardless of what the fixture
+    shell is doing. Needed for direct unit checks of the gate: an idle bash
+    sits at a readline prompt, which itself holds the PTY in non-canonical
+    mode - so a bare fixture engine looks like raw mode, whereas the case
+    under test is a CHILD in flight (readline hands canonical mode back
+    before running a command; a TUI then takes it away again via
+    tcsetattr(), a plain program doesn't)."""
+    def fake(fd):
+        attrs = list(real_tcgetattr(fd))
+        if icanon:
+            attrs[3] |= termios.ICANON
+        else:
+            attrs[3] &= ~termios.ICANON
+        return attrs
+    return fake
+
+
+def test_terminal_query_gate_allows_during_altscreen(bash_eng, monkeypatch):
     # A full-screen program legitimately owns the terminal and may query it -
     # but only while a command (the TUI itself) is actually in flight
     # (issue #48): put the struct source into RUNNING first, same as a real
-    # TUI session would be.
+    # TUI session would be - and only while the terminal is really in raw
+    # mode (issue #70), which a real TUI always sets - supply that fact
+    # explicitly rather than relying on the fixture's readline prompt.
+    monkeypatch.setattr(termios, "tcgetattr",
+                        _tcgetattr_with_icanon(termios.tcgetattr, icanon=False))
     bash_eng._struct.feed(_nonced(bash_eng, "C"))
     bash_eng._altscreen = True
     writes = []
     bash_eng._proc.write = lambda data: writes.append(data)
     bash_eng._answer_terminal_queries(b"\x1b[6n", was_idle=False)
     assert writes == [b"\x1b[1;1R"]
+
+
+def test_terminal_query_gate_blocks_fake_altscreen_in_canonical_mode(bash_eng, monkeypatch):
+    # Issue #70: `_altscreen` is set from bytes in the OUTPUT stream, which a
+    # command's own output controls. A child that printed the alt-screen
+    # enter sequence but never left canonical mode (cat on a hostile file,
+    # printf) is not a TUI, and a query in that same output must not be
+    # answered - the reply would land in the shell's stdin as keystrokes.
+    # Model the mid-command state exactly: a child owns the foreground and
+    # the terminal is in canonical mode (the fixture shell's own readline
+    # prompt would otherwise report ICANON off - see _tcgetattr_with_icanon).
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: bash_eng._shell_pid + 1)
+    monkeypatch.setattr(termios, "tcgetattr",
+                        _tcgetattr_with_icanon(termios.tcgetattr, icanon=True))
+    bash_eng._struct.feed(_nonced(bash_eng, "C"))
+    bash_eng._altscreen = True
+    writes = []
+    bash_eng._proc.write = lambda data: writes.append(data)
+    bash_eng._answer_terminal_queries(b"\x1b[?1049h\x1b[6n", was_idle=False)
+    assert writes == [], \
+        "answered a query behind a fake alt-screen enter in canonical mode"
+
+
+def test_fake_altscreen_in_command_output_does_not_forge_input(bash_eng):
+    # Issue #70 end-to-end: a plain command whose own stdout carries the
+    # alt-screen enter sequence and then a cursor-position query. printf's
+    # runtime escape decoding makes those real program output (a literal
+    # ESC typed on the command line would be eaten by readline instead).
+    # Before the fix the gate's alt-screen rule answered it, the reply
+    # echoed back into this command's stdout as `^[[1;1R`, and a stray `R`
+    # was left typed at the next prompt.
+    writes = []
+    real_write = bash_eng._proc.write
+
+    def spy(data):
+        writes.append(data)
+        return real_write(data)
+
+    bash_eng._proc.write = spy
+    r1 = bash_eng.run_command(
+        "printf '\\033[?1049h\\033[6n'; sleep 0.4; echo body", timeout=5, idle=1.0)
+    assert r1["completed"], r1
+    assert r1["stdout"] == "body", r1
+    assert r1["state"] == "idle", r1
+    r2 = bash_eng.run_command("echo canary", timeout=3)
+    assert r2 == {"stdout": "canary", "exit_code": 0,
+                  "completed": True, "state": "idle"}
+    assert not any(b"\x1b[1;1R" in w for w in writes), \
+        "a query behind a fake alt-screen enter in a command's own output was answered"
+
+
+def test_state_is_not_tui_for_canonical_command_that_printed_altscreen(bash_eng):
+    # Issue #70, state side: while a plain (canonical-mode) command that
+    # merely printed the alt-screen sequence is still in flight, state must
+    # say "running", not "tui" - only a program that really switched the
+    # terminal to raw mode is a TUI.
+    r = bash_eng.run_command("printf '\\033[?1049h'; sleep 1.2", timeout=0.3)
+    assert r["completed"] is False
+    assert r["state"] == "running", r
+    bash_eng.wait_for(timeout=5)
+    assert bash_eng.read_screen()["state"] == "idle"
 
 
 def test_terminal_query_gate_blocks_child_that_never_emitted_a_mark(bash_eng, monkeypatch):
