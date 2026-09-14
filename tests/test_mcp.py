@@ -83,3 +83,58 @@ def test_dead_engine_is_respawned_not_reused_forever(monkeypatch):
         if server._engine is not None:
             server._engine.close()
         server._engine = None
+
+
+def test_tool_errors_keep_their_text_over_stdio():
+    """issue #75: mcp 2.x replaces a tool's exception text with a bare
+    "Error executing tool <name>"; ToolError is the only type whose message
+    survives to the client."""
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not installed")
+    env = dict(os.environ, SHELL=bash)
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "cleat.server"], env=env)
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                # (a) state error: text tell us what to call next
+                await session.call_tool("run_command",
+                                        {"command": "python3 -q", "timeout": 2})
+                r = await session.call_tool("run_command", {"command": "echo hi"})
+                assert r.is_error
+                text = _text(r)
+                assert "send_keys()" in text, text
+                assert "not idle" in text, text
+
+                # (b) bounds error: text carries the violated bound
+                r2 = await session.call_tool("resize",
+                                             {"cols": 1000000000000, "rows": 24})
+                assert r2.is_error
+                assert "1..500" in _text(r2), _text(r2)
+
+    asyncio.run(run())
+
+
+def test_tool_input_schemas_survive_error_wrapper():
+    """issue #75 guard: the error wrapper must not flatten the advertised
+    tool signature (a bare *args/**kwargs wrapper would)."""
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not installed")
+    env = dict(os.environ, SHELL=bash)
+    params = StdioServerParameters(
+        command=sys.executable, args=["-m", "cleat.server"], env=env)
+
+    async def run():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = {t.name: t for t in (await session.list_tools()).tools}
+                props = tools["run_command"].input_schema["properties"]
+                assert {"command", "timeout", "exact"} <= set(props), props
+
+    asyncio.run(run())

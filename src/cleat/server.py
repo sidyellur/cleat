@@ -44,12 +44,20 @@ own native emitter, counts as a forgery attempt.)
 """
 
 import atexit
+import functools
 import threading
 
 try:  # mcp >= 2.0 renamed FastMCP to MCPServer and removed the old import path
     from mcp.server.mcpserver import MCPServer as _Server
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server
+
+try:  # mcp >= 2.0: only ToolError keeps its message - any other exception is
+    # wrapped by the SDK as UnexpectedToolError("Error executing tool <name>")
+    # and the text is dropped before it reaches the client (issue #75).
+    from mcp.server.mcpserver.exceptions import ToolError
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp.exceptions import ToolError
 
 from .engine import Engine
 
@@ -60,6 +68,23 @@ _engine = None
 # calls could otherwise each spawn a shell. Engine methods serialize
 # themselves; this only guards the create/respawn decision.
 _engine_lock = threading.Lock()
+
+
+def _tool_error_text(fn):
+    """Let a tool's own ValueError/RuntimeError text reach the client.
+
+    mcp >= 2.0 renders an uncaught exception as a bare
+    "Error executing tool <name>" and throws the message away; re-raising it as
+    the SDK's ToolError keeps the actionable guidance (which state the session is
+    in, what to call next, which bound was violated) in the client's result.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (ValueError, RuntimeError) as exc:
+            raise ToolError(str(exc)) from exc
+    return wrapper
 
 
 def _get_engine() -> Engine:
@@ -86,6 +111,7 @@ def _shutdown():
 
 
 @mcp.tool()
+@_tool_error_text
 def run_command(command: str, timeout: float = 10.0, exact: bool = False) -> dict:
     """Run a shell command in a PERSISTENT terminal session.
 
@@ -121,6 +147,7 @@ def run_command(command: str, timeout: float = 10.0, exact: bool = False) -> dic
 
 
 @mcp.tool()
+@_tool_error_text
 def send_keys(keys: str, enter: bool = False, timeout: float = 2.0,
               confirm_password_prompt: bool = False) -> dict:
     """Send input to a running interactive program (a REPL, a prompt, a TUI)
@@ -144,6 +171,7 @@ def send_keys(keys: str, enter: bool = False, timeout: float = 2.0,
 
 
 @mcp.tool()
+@_tool_error_text
 def read_screen() -> dict:
     """Return what the terminal currently LOOKS LIKE - the virtual screen
     rendered by a terminal emulator - plus the cursor [x, y]. Use this to
@@ -159,6 +187,7 @@ def read_screen() -> dict:
 
 
 @mcp.tool()
+@_tool_error_text
 def resize(cols: int, rows: int) -> dict:
     """Resize the terminal (PTY + virtual screen). Use before/while driving a
     full-screen TUI so it lays out for the size you want to read. Returns the
@@ -168,6 +197,7 @@ def resize(cols: int, rows: int) -> dict:
 
 
 @mcp.tool()
+@_tool_error_text
 def watch_files(path: str) -> dict:
     """Enable the files-touched feature: after this, run_command results include
     files_changed = {created, modified, deleted} for files under `path`. Pass a
@@ -180,6 +210,7 @@ def watch_files(path: str) -> dict:
 
 
 @mcp.tool()
+@_tool_error_text
 def read_output(timeout: float = 2.0) -> dict:
     """Poll the session for new raw text output without sending anything - e.g.
     to watch a long-running command or streaming build log (not truncated to the
@@ -193,6 +224,7 @@ def read_output(timeout: float = 2.0) -> dict:
 
 
 @mcp.tool()
+@_tool_error_text
 def wait_for(timeout: float = 30.0) -> dict:
     """Block until the session needs attention instead of polling for it.
 
